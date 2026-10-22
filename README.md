@@ -30,6 +30,34 @@ Flare is faster for one request; vLLM is faster for four.
 Measured 2026-10-22 with adaptive DSpark verification, the Engram row cache at
 6G, and the rendezvous on the fabric (see "Three settings that decide the speed").
 
+## Real work: one prompt, one shot
+
+<p align="center">
+  <img src="assets/neon-city-demo.gif" alt="Neon city, generated in one shot" width="760">
+</p>
+
+A single request: a long spec for a **futuristic neon city at night in the rain**
+in three.js (thousands of lit windows, holographic billboards, wet reflective
+streets, rain, flying-car lanes, fog, and an exact 60-second camera
+flythrough), reasoning effort **Max**. The model wrote a 2,274-line page that
+runs as is. [`examples/neon-city/`](examples/neon-city/) has the untouched HTML
+and a 63-second recording.
+
+| One request, 651-token prompt | |
+|---|---:|
+| Generated | **114,645 tokens in 30.6 min — 62.5 tok/s average** |
+| First token | 841 ms |
+
+<p align="center">
+  <img src="assets/chat-neon-city.jpg" alt="The chat with the run's statistics" width="49%">
+  <img src="assets/dashboard-code.jpg" alt="Flare metrics while the model writes code: 91.4 tok/s, 5.08 tokens per step" width="49%">
+</p>
+
+The dashboard (right, from a code request on the same card) shows what DSpark
+does on code: 5.08 tokens per step and 96–100% acceptance on the first three
+draft positions. Free reasoning at temperature 1.0 drafts less well, so the
+average over a long Max-effort request is lower than the code-phase peak.
+
 ## Quality
 
 | Check | Result |
@@ -169,6 +197,7 @@ scripts/stage.sh                bin, env and unit to the four nodes
 systemd/                        the Type=notify unit, one rank per node (no [Install]: never start at boot)
 tests/smoke.py                  six one-request checks
 tests/profile-decode.py         per-round wall time vs GPU time of one decode
+examples/neon-city/             a one-shot run: untouched output, recording
 cluster.env                     your nodes
 deepseek-v41-1017-flare.env     every knob, with the measured reason for its value
 pins.env                        checkpoint revision, Flare commit, paths
