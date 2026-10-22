@@ -1,0 +1,62 @@
+From 24b3663641a1d70bed3a3d4931d71fca1ef7bed6 Mon Sep 17 00:00:00 2001
+From: Carlos Alvarado Martinez <45523697+calvarado2004@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 23:11:27 -0400
+Subject: [PATCH 1/3] deepseek41: load ModelOpt NVFP4 routed experts (W4A4)
+ when quantized_layers declares them
+
+---
+ ignition/recipes/deepseek41/weights.py | 34 ++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/ignition/recipes/deepseek41/weights.py b/ignition/recipes/deepseek41/weights.py
+index 538f3ed..a19d739 100644
+--- a/ignition/recipes/deepseek41/weights.py
++++ b/ignition/recipes/deepseek41/weights.py
+@@ -92,6 +92,17 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
+ 
+     def load_experts(self, prefixes, interval):
+         text = self.config.text
++        group = prefixes[0].rsplit(".", 1)[0]
++        declared = (self.config.quantization.get("quantized_layers") or {}).get(group)
++        if declared is not None:
++            # ModelOpt NVFP4 transcode of the native MXFP4 experts, with calibrated input scales.
++            if declared.get("quant_algo") != "NVFP4" or declared.get("group_size") != 16:
++                raise ValueError(f"{group}: unsupported expert quantization {declared!r}")
++            return self.load_fp4_experts(prefixes, hidden_size=text["hidden_size"],
++                intermediate_size=text["moe_intermediate_size"], intermediate_range=interval,
++                swiglu_limit=text["swiglu_limit"], format="nvfp4", activation_mode="a4",
++                scale_vectors=_nvfp4_expert_scales(self._sources, prefixes),
++                projection_names=("w3", "w1", "w2"))
+         return self.load_mxfp4_experts(prefixes, hidden_size=text["hidden_size"],
+             intermediate_size=text["moe_intermediate_size"], intermediate_range=interval,
+             swiglu_limit=text["swiglu_limit"], scale_name="scale", projection_names=("w3", "w1", "w2"),
+@@ -154,3 +165,26 @@ class DeepSeekWeightLoader(BlockFP8WeightLoader):
+                 "weight": self.load_tensor(prefix + ".engram.q_weight").float()
+                           * self.load_tensor(prefix + ".engram.k_weight").float()}
+         return LayerWeights(result, routed, residual, engram)
++
++
++def _nvfp4_expert_scales(sources, prefixes):
++    """Global weight scales and reciprocal activation scales for W4A4 NVFP4 experts."""
++    w13, w2, a1, a2 = [], [], [], []
++    for prefix in prefixes:
++        values = {}
++        for projection in ("w1", "w3", "w2"):
++            for suffix in ("weight_scale_2", "input_scale"):
++                name = f"{prefix}.{projection}.{suffix}"
++                value = sources[name]
++                if (value.device.type != "cpu" or value.dtype != torch.float32 or value.numel() != 1
++                        or not bool((torch.isfinite(value) & (value > 0)).all())):
++                    raise ValueError(f"{name}: expected a finite positive FP32 scalar")
++                values[projection, suffix] = value.item()
++        if values["w1", "weight_scale_2"] != values["w3", "weight_scale_2"]:
++            raise ValueError(f"{prefix}: gate/up weight global scales differ")
++        w13.append(values["w3", "weight_scale_2"])
++        w2.append(values["w2", "weight_scale_2"])
++        a1.append(max(values["w1", "input_scale"], values["w3", "input_scale"]))
++        a2.append(values["w2", "input_scale"])
++    return (torch.tensor(w13, dtype=torch.float32), torch.tensor(w2, dtype=torch.float32),
++            torch.tensor(a1, dtype=torch.float32).reciprocal(), torch.tensor(a2, dtype=torch.float32).reciprocal())
+-- 
+2.54.0 (Apple Git-157)
+

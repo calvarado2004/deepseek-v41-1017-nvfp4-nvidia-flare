@@ -1,0 +1,34 @@
+[Unit]
+Description=NVIDIA Flare DeepSeek-V4.1-Flash-1017 NVFP4, TP=4 on the four-Spark ring (node rank %i of 4) on DGX Spark
+After=network-online.target
+Wants=network-online.target
+# Add Conflicts= for any other model unit that uses the same GPUs.
+StartLimitBurst=0
+
+[Service]
+# notify: rank 0 holds "activating" until /health answers and the warm burst
+# is done; headless ranks report ready once their rank runs.
+Type=notify
+NotifyAccess=all
+# The account from cluster.env (SPARK_USER); scripts/stage.sh fills it in.
+User=@SPARK_USER@
+Group=@SPARK_USER@
+WorkingDirectory=/opt/spark-llm/profiles/deepseek-v41-1017-flare
+Environment=HOME=/home/@SPARK_USER@
+EnvironmentFile=-/etc/spark-llm/profiles/deepseek-v41-1017-flare.env
+# RoCE registers pinned host memory: the system default (8 MiB) fails the load
+# with "cannot lock ... raise RLIMIT_MEMLOCK".
+LimitMEMLOCK=infinity
+# GB10 allocations need MemFree, not MemAvailable: drop clean page cache first.
+ExecStartPre=+/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+# Rank 0 waits for its three ring peers (SPARK_RING_PEERS in cluster.env).
+ExecStartPre=/bin/bash -c 'if [ "%i" = "0" ]; then for peer in @SPARK_RING_PEERS@; do for i in $(seq 1 150); do ping -c1 -W1 $$peer >/dev/null 2>&1 && continue 2; sleep 2; done; echo "peer $$peer unreachable after 300s" >&2; exit 1; done; fi'
+ExecStart=/opt/spark-llm/profiles/deepseek-v41-1017-flare/bin/launch-rank %i
+
+TimeoutStartSec=1800
+WatchdogSec=0
+TimeoutStopSec=90
+KillMode=control-group
+
+# NO [Install] SECTION, DELIBERATELY: an inference unit must never be enabled
+# or start at boot (a model that starts at boot fills unified memory before anything else can).

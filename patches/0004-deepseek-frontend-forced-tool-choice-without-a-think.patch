@@ -1,0 +1,101 @@
+From 71dc44922fe1cc788f21c02fa1d831fa4a02bb4d Mon Sep 17 00:00:00 2001
+From: Carlos Alvarado Martinez <45523697+calvarado2004@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 12:39:10 -0400
+Subject: [PATCH] deepseek frontend: forced tool choice without a thinking
+ request encodes in chat mode
+
+OpenAI clients (Qwen Code side queries) send tool_choice "required" without a
+thinking mode. Thinking is the DeepSeek default, so these failed with HTTP 400
+"thinking mode does not support required tool choice". When the request named no
+thinking mode, encode it in chat mode (the format a forced call needs); an explicit
+thinking request with a forced tool still fails.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ helios/src/frontend/deepseek.rs   | 17 +++++++++++++----
+ helios/tests/deepseek_requests.rs | 20 +++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/helios/src/frontend/deepseek.rs b/helios/src/frontend/deepseek.rs
+index c44e86f..067b605 100644
+--- a/helios/src/frontend/deepseek.rs
++++ b/helios/src/frontend/deepseek.rs
+@@ -93,6 +93,9 @@ fn conversation(
+             )));
+         }
+     }
++    // Whether the request itself chose a thinking mode, before package defaults apply.
++    let explicit_thinking =
++        options.contains_key("thinking_mode") || options.contains_key("enable_thinking");
+     let mut options = {
+         let mut merged = frontend.defaults.clone();
+         if options.contains_key("enable_thinking") && !options.contains_key("thinking_mode") {
+@@ -156,7 +159,7 @@ fn conversation(
+             "DeepSeek prompt encoding does not support documents",
+         ));
+     }
+-    let thinking_mode = match options.get("thinking_mode").filter(|v| !v.is_null()) {
++    let mut thinking_mode = match options.get("thinking_mode").filter(|v| !v.is_null()) {
+         Some(Json::String(value)) if value == "thinking" => true,
+         Some(Json::String(value)) if value == "chat" => false,
+         Some(_) => return Err(invalid("thinking_mode must be thinking or chat")),
+@@ -238,9 +241,15 @@ fn conversation(
+         return Err(invalid("required tool choice needs at least one tool"));
+     }
+     if tool_choice == ToolChoice::Required && thinking_mode {
+-        return Err(invalid(
+-            "thinking mode does not support required tool choice",
+-        ));
++        if explicit_thinking {
++            return Err(invalid(
++                "thinking mode does not support required tool choice",
++            ));
++        }
++        // The request forces a tool call and did not ask for thinking (OpenAI clients
++        // do this for structured side queries): encode it in chat mode, which the
++        // DeepSeek format requires for a forced call, instead of rejecting it.
++        thinking_mode = false;
+     }
+     let response_format = match options.get("response_format").filter(|v| !v.is_null()) {
+         None => ResponseFormat::Text,
+diff --git a/helios/tests/deepseek_requests.rs b/helios/tests/deepseek_requests.rs
+index 499cb85..e562ac6 100644
+--- a/helios/tests/deepseek_requests.rs
++++ b/helios/tests/deepseek_requests.rs
+@@ -344,6 +344,23 @@ fn required_tools_in_chat_mode_start_inside_the_dsml_envelope() {
+     }
+ }
+ 
++#[test]
++fn required_tools_without_a_thinking_request_use_chat_mode() {
++    // OpenAI clients force a tool for structured side queries without naming a
++    // thinking mode; those requests encode exactly as explicit chat mode.
++    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
++        let f = Fixture::new(encoder);
++        let tools = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]);
++        let implicit = f.prepare(json!({"tool_choice":"required","tools":tools})).unwrap();
++        let chat = f
++            .prepare(json!({"enable_thinking":false,"tool_choice":"required","tools":tools}))
++            .unwrap();
++        assert_eq!(implicit.rendered_prompt, chat.rendered_prompt, "{encoder:?}");
++        assert_eq!(implicit.prompt.tokens, chat.prompt.tokens);
++        assert_eq!(implicit.output.content.start, OutputStart::ToolBody);
++    }
++}
++
+ #[test]
+ fn native_reasoning_options_are_validated_through_request_preparation() {
+     for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+@@ -356,7 +373,8 @@ fn native_reasoning_options_are_validated_through_request_preparation() {
+             json!({"chat_template_kwargs":{"drop_thinking":true}}),
+             json!({"chat_template_kwargs":{"continue_final_message":true}}),
+             json!({"chat_template_kwargs":{"add_generation_prompt":false}}),
+-            json!({"tool_choice":"required","tools":[{"type":"function","function":{"name":"lookup"}}]}),
++            json!({"enable_thinking":true,"tool_choice":"required","tools":[{"type":"function","function":{"name":"lookup"}}]}),
++            json!({"chat_template_kwargs":{"thinking_mode":"thinking"},"tool_choice":"required","tools":[{"type":"function","function":{"name":"lookup"}}]}),
+         ] {
+             assert!(f.prepare(extra.clone()).is_err(), "{extra}");
+         }
+-- 
+2.43.0
+
