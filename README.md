@@ -69,6 +69,7 @@ average over a long Max-effort request is lower than the code-phase peak.
 | 80 concurrent short requests | 80/80 correct |
 | Video, a moving object (TLS front frames) | direction and visibility right |
 | Qwen Code, a small car-dealership Python project | 18 tool calls, 6 modules, **36/36 tests pass**; Qwen Code's side queries pass with patch 0004 |
+| Long agent session, 401 messages (patch 0006) | first token in 0.3 s with the prefix cache; cold 69.7 s for 41.7K tokens |
 | `tests/smoke.py` (6 checks) | 6/6 in 12 s |
 
 Images work (`image_url` parts); the 44-image set that the vLLM recipe scores is
@@ -90,7 +91,7 @@ not scored on Flare yet.
 
 | Layer | Choice |
 |---|---|
-| Engine | Flare `5f37bd1` + 5 patches (`patches/`), built from source on each node |
+| Engine | Flare `5f37bd1` + 6 patches (`patches/`), built from source on each node |
 | Package | `ignition export` at TP=4 with `--roce-ring`, max concurrency 4, 5 DSpark drafts, prefill chunk 4,096 |
 | Experts | NVFP4 W4A4 (patch 0001 teaches Flare's DeepSeek-V4.1 recipe the ModelOpt NVFP4 layout) |
 | Engram tables | widened from packed E2M1 to E4M3 rows, exactly (`scripts/make-flare-checkpoint.py`); rows from NVMe through a 6G row cache |
@@ -108,6 +109,7 @@ not scored on Flare yet.
 | 0003 | Give Helios the RoCE proxy ABI 10 that the locked FlashInfer exports ([#7](https://github.com/NVIDIA/flare-local-inference/issues/7), closed upstream after our pin). |
 | 0004 | A request with `tool_choice: "required"` that asks for no thinking mode is encoded in chat mode. Flare thinks by default, so these requests got HTTP 400 "thinking mode does not support required tool choice"; Qwen Code sends them for its side queries. A request that asks for thinking and forces a tool still gets the 400. |
 | 0005 | Upstream [#75](https://github.com/NVIDIA/flare-local-inference/pull/75) by Martin Vit, ported to the pin (one test edit). A finished response must copy its cache snapshot before Flare sends `finish_reason` and `[DONE]`, and that copy lost to other requests' decode. Two long Qwen Code sessions at 265-325K tokens stalled: a finished `compress` reply waited 16.6 h and came back only when the other session's turn was cancelled. With the patch, `scripts/check_response_completion.py` closes a short reply 2.5 ms after its last token while a long one keeps decoding. The package does not need a new export. |
+| 0006 | Find the prefix-cache boundaries of a request with one tokenization. Flare at the pin renders and tokenizes every message prefix, so the cost is messages × prompt length on one frontend thread: a ~290K-token Qwen Code turn stayed in the frontend for more than 15 minutes, with the GPU idle. The patch renders only the text of each prefix and cuts the prompt's own tokens through byte offsets; Jinja templates, and any prompt whose offsets do not reproduce its token IDs, keep the old path. Tests compare it with the old function, also with the checkpoint tokenizer. Upstream `67ba265e` (after our pin) removes the same loop. |
 
 ## Three settings that decide the speed
 
@@ -177,6 +179,11 @@ Flare update that changes the package format.
   export with wider batch-2/4 captures is the open item.
 - **Prefix reuse** happens at message boundaries only, so long multi-turn
   agent sessions re-prefill more than on vLLM.
+- **Weights**: the LibertAIDAI checkpoint stores the Engram tables in FP4, and
+  its experts are an NVFP4 transcode of DeepSeek's MXFP4 experts. On Flare
+  neither saves GPU memory (Engram rows stay on NVMe). The official
+  `deepseek-ai/DeepSeek-V4.1-Flash-1017` checkpoint loads without patch 0001
+  or `make-flare-checkpoint.py` and keeps the FP8 Engram tables. A move to it is planned.
 - Flare's docs call physical ring cabling and full-model ring serving
   "unqualified". This recipe is a community result on that path, not an NVIDIA
   configuration.
@@ -187,7 +194,7 @@ Flare update that changes the package format.
 bin/launch-rank                 one rank: flare run with the recipe's settings; rank 0 adds HTTP and the TLS front
 bin/tls-front.py                TLS on :8888, video parts become frames
 bin/dsv41_video_frames.py       the frame sampler (from the vLLM recipe)
-patches/                        0001-0005 for Flare 5f37bd1 (see NOTICE)
+patches/                        0001-0006 for Flare 5f37bd1 (see NOTICE)
 scripts/build-flare.sh          build patched Flare on one node
 scripts/fetch.sh                checkpoint to rank 0, then make-flare-checkpoint.py
 scripts/make-flare-checkpoint.py   exact E2M1 -> E4M3 widening of the Engram tables into a view directory
@@ -209,6 +216,7 @@ pins.env                        checkpoint revision, Flare commit, paths
 - **NVIDIA** — Flare: Ignition, Helios, RoCEnante, DSpark support.
 - **dbotwinick** — the shared-memory fix on Flare issue #2 (patch 0002), and
   issue #7 (patch 0003).
+- **Martin Vit** — Flare PR #75, the terminal-snapshot fix (patch 0005).
 - **LibertAIDAI** — the NVFP4 checkpoint.
 - **DeepSeek** — the model and DSpark.
 - **FlashInfer** contributors — the RoCE proxy sources in patch 0003.

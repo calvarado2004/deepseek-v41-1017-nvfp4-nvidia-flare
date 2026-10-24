@@ -3,7 +3,7 @@ Copyright (c) 2026 Carlos Alvarado Martinez — MIT, see LICENSE.
 
 This repository includes third-party material under its own licenses:
 
-- patches/0001-0005: changes to NVIDIA/flare-local-inference (Apache-2.0) at
+- patches/0001-0006: changes to NVIDIA/flare-local-inference (Apache-2.0) at
   5f37bd14062334f7687d168d58ea00567b9aa7fe; they are Apache-2.0 like the code
   they change.
   - 0002 is the fix dbotwinick posted on NVIDIA/flare-local-inference#2.

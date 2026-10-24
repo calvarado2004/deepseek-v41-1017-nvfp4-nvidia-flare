@@ -1,0 +1,384 @@
+From 0da8f4a84047fe99a240659ac111ecb8f41abf69 Mon Sep 17 00:00:00 2001
+From: Carlos Alvarado Martinez <45523697+calvarado2004@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:43:28 -0400
+Subject: [PATCH] helios: find native message boundaries with one tokenization
+
+message_boundaries renders and tokenizes every message prefix of a request
+to find its prefix-cache checkpoints. With the native DeepSeek encoders each
+prefix render tokenizes the whole prefix, so a request costs messages x prompt
+length on one frontend thread. A Qwen Code session at ~290K tokens kept the
+frontend busy for more than 15 minutes before the request reached the
+scheduler (GPU idle, 0 pending, 1 HTTP request in flight).
+
+rendered_message_boundaries renders only the text of each prefix and cuts the
+complete prompt where that text ends, through byte offsets from one encoding of
+the prompt. It keeps a cut only at a token start. Jinja templates, and prompts
+whose offset encoding does not reproduce their token IDs exactly, use
+message_boundaries unchanged.
+
+Tests compare the result with message_boundaries: agent sessions with tool
+calls, dropped reasoning, Unicode and whitespace runs, image placeholders, the
+fallback paths, and the checkpoint tokenizer (ignored without
+FLARE_DEEPSEEK_TEST_SNAPSHOT). A 201K-token, 242-boundary session takes 1.2 s
+instead of 26.1 s in a debug build.
+---
+ helios/src/frontend/deepseek.rs   |  57 +++++++++-
+ helios/src/model.rs               |   2 +-
+ helios/src/model/prompt.rs        |  44 +++++++-
+ helios/src/server/request.rs      |   2 +-
+ helios/tests/deepseek_requests.rs | 170 ++++++++++++++++++++++++++++++
+ 5 files changed, 268 insertions(+), 7 deletions(-)
+
+diff --git a/helios/src/frontend/deepseek.rs b/helios/src/frontend/deepseek.rs
+index 067b6050..bc60a19b 100644
+--- a/helios/src/frontend/deepseek.rs
++++ b/helios/src/frontend/deepseek.rs
+@@ -387,12 +387,12 @@ pub(super) fn render(
+     render_prompt(frontend, messages, options, true)
+ }
+ 
+-fn render_prompt(
++fn render_text(
+     frontend: &Frontend,
+     messages: &[Json],
+     options: &Map<String, Json>,
+     generation_prompt: bool,
+-) -> Result<RenderedPrompt> {
++) -> Result<deepseek_recipe_encoding::RenderedPrompt> {
+     let conversation = conversation(frontend, messages, options)?;
+     let mut rendered = official(frontend.prompt_encoder, &conversation);
+     if !generation_prompt {
+@@ -401,6 +401,16 @@ fn render_prompt(
+             .ok_or_else(|| invalid("canonical prompt lacks its assistant generation header"))?;
+         rendered.prompt.truncate(end);
+     }
++    Ok(rendered)
++}
++
++fn render_prompt(
++    frontend: &Frontend,
++    messages: &[Json],
++    options: &Map<String, Json>,
++    generation_prompt: bool,
++) -> Result<RenderedPrompt> {
++    let rendered = render_text(frontend, messages, options, generation_prompt)?;
+     let image_sources = rendered
+         .image_sources
+         .into_iter()
+@@ -464,4 +474,47 @@ impl Frontend {
+         options.insert("continue_final_message".into(), false.into());
+         render_prompt(self, messages, &options, false)
+     }
++
++    /// Render the text of a message prefix without its generation header, without
++    /// tokenizing it. None for Jinja templates.
++    pub fn render_boundary_text(
++        &self,
++        messages: &[Json],
++        options: &Map<String, Json>,
++    ) -> Option<Result<String>> {
++        if self.prompt_encoder == PromptEncoder::Jinja {
++            return None;
++        }
++        let mut options = options.clone();
++        options.insert("add_generation_prompt".into(), true.into());
++        options.insert("continue_final_message".into(), false.into());
++        Some(render_text(self, messages, &options, false).map(|rendered| rendered.prompt))
++    }
++
++    /// Byte range of every token of a native prompt, from one encoding of its text spans.
++    /// None for Jinja templates, or when the offsets are unordered or the encoding does not
++    /// reproduce `rendered.token_ids` exactly.
++    pub fn native_token_ranges(&self, rendered: &RenderedPrompt) -> Option<Vec<(usize, usize)>> {
++        if self.prompt_encoder == PromptEncoder::Jinja {
++            return None;
++        }
++        let mut ids = Vec::with_capacity(rendered.token_ids.len());
++        let mut ranges = Vec::with_capacity(rendered.token_ids.len());
++        let mut base = 0;
++        for (index, span) in rendered.text.split(IMAGE_SPECIAL_TOKEN).enumerate() {
++            if index != 0 {
++                // render_prompt puts the image placeholder ID in place of the marker text.
++                ids.push(*rendered.token_ids.get(ids.len())?);
++                ranges.push((base, base + IMAGE_SPECIAL_TOKEN.len()));
++                base += IMAGE_SPECIAL_TOKEN.len();
++            }
++            let encoding = self.tokenizer.encode(span, false).ok()?;
++            ids.extend_from_slice(encoding.get_ids());
++            ranges.extend(encoding.get_offsets().iter().map(|&(start, end)| (base + start, base + end)));
++            base += span.len();
++        }
++        let ordered = ranges.windows(2).all(|pair| pair[0].0 <= pair[1].0)
++            && ranges.iter().all(|&(start, end)| start <= end && end <= rendered.text.len());
++        (ordered && ids == rendered.token_ids).then_some(ranges)
++    }
+ }
+diff --git a/helios/src/model.rs b/helios/src/model.rs
+index 2fd10298..003b870f 100644
+--- a/helios/src/model.rs
++++ b/helios/src/model.rs
+@@ -18,7 +18,7 @@ pub use contract::PreparedContract;
+ pub use inputs::{InputStep, pack_inputs};
+ pub use packing::Inputs;
+ #[cfg(feature = "server")]
+-pub use prompt::{prepare_image_inputs, prepare_input, prepare_output, message_boundaries};
++pub use prompt::{prepare_image_inputs, prepare_input, prepare_output, message_boundaries, rendered_message_boundaries};
+ #[cfg(feature = "server")]
+ pub(crate) use prompt::validate_conditioned_inputs;
+ 
+diff --git a/helios/src/model/prompt.rs b/helios/src/model/prompt.rs
+index 4f0d1257..c21cefeb 100644
+--- a/helios/src/model/prompt.rs
++++ b/helios/src/model/prompt.rs
+@@ -168,9 +168,7 @@ pub fn message_boundaries(
+     messages: &[Value],
+     options: &Map<String, Value>,
+ ) -> Vec<usize> {
+-    let mut options = options.clone();
+-    options.insert("add_generation_prompt".into(), false.into());
+-    options.insert("continue_final_message".into(), false.into());
++    let options = boundary_options(options);
+     let mut boundaries = Vec::with_capacity(messages.len());
+     for count in 0..=messages.len() {
+         let Ok(prefix) = frontend.render_boundary(&messages[..count], &options) else {
+@@ -186,6 +184,46 @@ pub fn message_boundaries(
+     boundaries
+ }
+ 
++/// `message_boundaries` of a complete rendered prompt. Native encoders cut the prompt's
++/// own tokens where each prefix's text ends, so the prompt is tokenized once: tokenizing
++/// every prefix costs messages x prompt length, minutes at 300K tokens. Other encoders,
++/// and encodings whose offsets do not reproduce the prompt, use `message_boundaries`.
++pub fn rendered_message_boundaries(
++    frontend: &Frontend,
++    rendered: &RenderedPrompt,
++    messages: &[Value],
++    options: &Map<String, Value>,
++) -> Vec<usize> {
++    let Some(ranges) = frontend.native_token_ranges(rendered) else {
++        return message_boundaries(frontend, &rendered.token_ids, messages, options);
++    };
++    let options = boundary_options(options);
++    let mut boundaries = Vec::with_capacity(messages.len());
++    for count in 0..=messages.len() {
++        let Some(Ok(prefix)) = frontend.render_boundary_text(&messages[..count], &options) else {
++            continue;
++        };
++        let end = prefix.len();
++        if end == 0 || !rendered.text.starts_with(&prefix) {
++            continue;
++        }
++        let length = ranges.partition_point(|&(start, _)| start < end);
++        if length > 0 && length < rendered.token_ids.len() && ranges[length - 1].1 <= end {
++            boundaries.push(length);
++        }
++    }
++    boundaries.sort_unstable();
++    boundaries.dedup();
++    boundaries
++}
++
++fn boundary_options(options: &Map<String, Value>) -> Map<String, Value> {
++    let mut options = options.clone();
++    options.insert("add_generation_prompt".into(), false.into());
++    options.insert("continue_final_message".into(), false.into());
++    options
++}
++
+ pub fn prepare_output(
+     config: &ModelConfig,
+     frontend: &Frontend,
+diff --git a/helios/src/server/request.rs b/helios/src/server/request.rs
+index 9568202a..e42722c8 100644
+--- a/helios/src/server/request.rs
++++ b/helios/src/server/request.rs
+@@ -263,7 +263,7 @@ pub(super) fn prepare_inference_cached(
+     let mut message_boundaries = if raw.is_some() {
+         Vec::new()
+     } else {
+-        crate::model::message_boundaries(frontend, &rendered.token_ids, &normalized, &options)
++        crate::model::rendered_message_boundaries(frontend, &rendered, &normalized, &options)
+     };
+     let crate::model::PreparedInput {
+         tokens,
+diff --git a/helios/tests/deepseek_requests.rs b/helios/tests/deepseek_requests.rs
+index e562ac6a..eb52b6c5 100644
+--- a/helios/tests/deepseek_requests.rs
++++ b/helios/tests/deepseek_requests.rs
+@@ -446,3 +446,173 @@ fn base64_images_follow_the_rendered_placeholder_order() {
+     assert!(request.prompt.tokens.starts_with(&complete_message.tokens));
+     assert!(request.prompt.message_boundaries.contains(&complete_message.tokens.len()));
+ }
++
++fn boundary_tools() -> Value {
++    json!([{"type":"function","function":{"name":"read_file","description":"Read a file",
++        "parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}])
++}
++
++/// An agent session: tool calls and results, kept and dropped reasoning, Unicode, runs of
++/// whitespace, code, and text that looks like special tokens.
++fn agent_session(turns: usize, filler: usize) -> Vec<Value> {
++    let texts = [
++        "plain words and numbers 12345",
++        "  leading spaces\n\n\ttabs\r\nand blank lines\n\n\n",
++        "Unicode: café, 日本語, emoji 🦀🚀, combining e\u{301}, full-width ｜bar｜",
++        "```rust\nfn main() {\n    println!(\"{}\", 1 + 1);\n}\n```",
++        "looks special: <｜User｜ and <think without closing, </think trailing",
++        "trailing space ",
++    ];
++    let mut messages = vec![json!({"role":"system","content":"You are a coding agent."})];
++    for turn in 0..turns {
++        let text = format!("{} {}", texts[turn % texts.len()], "x".repeat(filler));
++        let id = format!("call_{turn}");
++        messages.push(json!({"role":"user","content":format!("turn {turn}: {text}")}));
++        messages.push(json!({"role":"assistant","reasoning_content":format!("think {turn}"),
++            "content":"", "tool_calls":[{"id":id,"type":"function","function":{"name":"read_file",
++            "arguments":format!("{{\"path\":\"src/{turn}.rs\"}}")}}]}));
++        messages.push(json!({"role":"tool","tool_call_id":id,"content":text}));
++        messages.push(json!({"role":"assistant","content":format!("done {turn}: {text}")}));
++    }
++    messages.push(json!({"role":"user","content":"Continue."}));
++    messages
++}
++
++fn rendered_for(f: &Fixture, messages: &[Value], options: &Map<String, Value>) -> frontend::RenderedPrompt {
++    let mut options = options.clone();
++    options.insert("add_generation_prompt".into(), true.into());
++    f.frontend.render_chat(messages, &options).unwrap()
++}
++
++#[test]
++fn native_boundaries_equal_per_prefix_tokenization() {
++    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
++        let f = Fixture::new(encoder);
++        let mut options = Map::new();
++        options.insert("tools".into(), boundary_tools());
++        for (turns, filler) in [(1, 0), (6, 3), (40, 17)] {
++            let messages = agent_session(turns, filler);
++            let rendered = rendered_for(&f, &messages, &options);
++            assert!(f.frontend.native_token_ranges(&rendered).is_some(), "{encoder:?}");
++            let expected = model::message_boundaries(&f.frontend, &rendered.token_ids, &messages, &options);
++            let actual = model::rendered_message_boundaries(&f.frontend, &rendered, &messages, &options);
++            assert!(!expected.is_empty());
++            assert_eq!(actual, expected, "{encoder:?}, {turns} turns");
++        }
++    }
++}
++
++#[test]
++fn prepared_requests_keep_per_prefix_boundaries() {
++    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
++        let f = Fixture::new(encoder);
++        let messages = agent_session(12, 5);
++        let prepared = f.prepare(json!({"messages":messages,"tools":boundary_tools()})).unwrap();
++        let mut options = Map::new();
++        options.insert("tools".into(), boundary_tools());
++        let expected = model::message_boundaries(&f.frontend, &prepared.prompt.tokens, &messages, &options);
++        assert_eq!(prepared.prompt.message_boundaries, expected, "{encoder:?}");
++        // Every user turn after the first assistant reply starts a reusable prefix.
++        assert!(expected.len() >= 12, "{encoder:?}: {expected:?}");
++    }
++}
++
++#[test]
++fn native_boundaries_count_image_placeholders_as_one_token() {
++    let f = Fixture::new(PromptEncoder::DeepseekV4);
++    let image = "data:image/png;base64,iVBORw0KGgo=";
++    let mut messages = vec![json!({"role":"user","content":[
++        {"type":"image_url","image_url":{"url":image}},{"type":"text","text":"What is this?"}]})];
++    messages.push(json!({"role":"assistant","content":"A screenshot."}));
++    messages.push(json!({"role":"user","content":[{"type":"text","text":"And this one?"},
++        {"type":"image_url","image_url":{"url":image}}]}));
++    messages.push(json!({"role":"assistant","content":"Another one, 日本語 🦀."}));
++    messages.push(json!({"role":"user","content":"Compare them."}));
++    let rendered = rendered_for(&f, &messages, &Map::new());
++    assert_eq!(rendered.image_sources.len(), 2);
++    assert!(f.frontend.native_token_ranges(&rendered).is_some());
++    let expected = model::message_boundaries(&f.frontend, &rendered.token_ids, &messages, &Map::new());
++    assert!(expected.len() >= 2, "{expected:?}");
++    assert_eq!(model::rendered_message_boundaries(&f.frontend, &rendered, &messages, &Map::new()), expected);
++}
++
++#[test]
++fn native_boundaries_fall_back_when_offsets_do_not_reproduce_the_prompt() {
++    let f = Fixture::new(PromptEncoder::DeepseekV41);
++    let messages = agent_session(5, 2);
++    let mut rendered = rendered_for(&f, &messages, &Map::new());
++    let last = rendered.token_ids.len() - 1;
++    rendered.token_ids[last] ^= 1;
++    assert!(f.frontend.native_token_ranges(&rendered).is_none());
++    let expected = model::message_boundaries(&f.frontend, &rendered.token_ids, &messages, &Map::new());
++    assert!(!expected.is_empty());
++    assert_eq!(model::rendered_message_boundaries(&f.frontend, &rendered, &messages, &Map::new()), expected);
++    let jinja = Fixture::new(PromptEncoder::Jinja);
++    let rendered = rendered_for(&jinja, &messages, &Map::new());
++    assert!(jinja.frontend.native_token_ranges(&rendered).is_none());
++    assert!(jinja.frontend.render_boundary_text(&messages, &Map::new()).is_none());
++}
++
++#[test]
++fn native_boundaries_do_not_tokenize_every_prefix() {
++    // 242 messages of ~1 KB: message_boundaries tokenizes every one of the growing prefixes.
++    let f = Fixture::new(PromptEncoder::DeepseekV41);
++    let messages = agent_session(60, 1000);
++    let rendered = rendered_for(&f, &messages, &Map::new());
++    let start = std::time::Instant::now();
++    let expected = model::message_boundaries(&f.frontend, &rendered.token_ids, &messages, &Map::new());
++    let reference = start.elapsed();
++    let start = std::time::Instant::now();
++    let actual = model::rendered_message_boundaries(&f.frontend, &rendered, &messages, &Map::new());
++    let native = start.elapsed();
++    eprintln!("{} tokens, {} boundaries: per-prefix {reference:?}, native {native:?}",
++        rendered.token_ids.len(), actual.len());
++    assert_eq!(actual, expected);
++    assert!(native * 5 < reference, "per-prefix {reference:?}, native {native:?}");
++}
++
++#[test]
++#[ignore = "requires FLARE_DEEPSEEK_TEST_SNAPSHOT pointing to the DeepSeek checkpoint"]
++fn native_boundaries_equal_per_prefix_tokenization_with_the_checkpoint_tokenizer() {
++    let root = std::path::PathBuf::from(std::env::var_os("FLARE_DEEPSEEK_TEST_SNAPSHOT").unwrap());
++    let asset = |path: std::path::PathBuf| Asset {
++        sha256: format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap())),
++        path,
++        range: None,
++    };
++    let tokens = support::tokens(&asset(root.join("tokenizer_config.json"))).unwrap();
++    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
++        let settings = FrontendSettings {
++            tokenizer: tokens.clone(),
++            eos_token_ids: vec![],
++            prompt_encoder: encoder,
++            image_placeholder_token_id: None,
++            template_encoding: Default::default(),
++            image: None,
++        };
++        let frontend = Frontend::load_with_settings(
++            FrontendAssets {
++                tokenizer: asset(root.join("tokenizer.json")),
++                tokens: tokens.clone(),
++                chat_template: None,
++            },
++            Map::new(),
++            &settings,
++        )
++        .unwrap();
++        let mut options = Map::new();
++        options.insert("tools".into(), boundary_tools());
++        let messages = agent_session(40, 300);
++        let mut render = options.clone();
++        render.insert("add_generation_prompt".into(), true.into());
++        let rendered = frontend.render_chat(&messages, &render).unwrap();
++        assert!(frontend.native_token_ranges(&rendered).is_some(), "{encoder:?}");
++        let expected = model::message_boundaries(&frontend, &rendered.token_ids, &messages, &options);
++        assert!(expected.len() >= 40, "{encoder:?}: {expected:?}");
++        assert_eq!(
++            model::rendered_message_boundaries(&frontend, &rendered, &messages, &options),
++            expected,
++            "{encoder:?}"
++        );
++    }
++}
+-- 
+2.43.0
+
