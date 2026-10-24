@@ -90,7 +90,7 @@ not scored on Flare yet.
 
 | Layer | Choice |
 |---|---|
-| Engine | Flare `5f37bd1` + 4 patches (`patches/`), built from source on each node |
+| Engine | Flare `5f37bd1` + 5 patches (`patches/`), built from source on each node |
 | Package | `ignition export` at TP=4 with `--roce-ring`, max concurrency 4, 5 DSpark drafts, prefill chunk 4,096 |
 | Experts | NVFP4 W4A4 (patch 0001 teaches Flare's DeepSeek-V4.1 recipe the ModelOpt NVFP4 layout) |
 | Engram tables | widened from packed E2M1 to E4M3 rows, exactly (`scripts/make-flare-checkpoint.py`); rows from NVMe through a 6G row cache |
@@ -107,6 +107,7 @@ not scored on Flare yet.
 | 0002 | Raise the dynamic shared memory limits before graph nodes are rebuilt (dbotwinick's fix on [#2](https://github.com/NVIDIA/flare-local-inference/issues/2)). Without it the load fails at "Prepare execution". |
 | 0003 | Give Helios the RoCE proxy ABI 10 that the locked FlashInfer exports ([#7](https://github.com/NVIDIA/flare-local-inference/issues/7), closed upstream after our pin). |
 | 0004 | A request with `tool_choice: "required"` that asks for no thinking mode is encoded in chat mode. Flare thinks by default, so these requests got HTTP 400 "thinking mode does not support required tool choice"; Qwen Code sends them for its side queries. A request that asks for thinking and forces a tool still gets the 400. |
+| 0005 | Upstream [#75](https://github.com/NVIDIA/flare-local-inference/pull/75) by Martin Vit, ported to the pin (one test edit). A finished response must copy its cache snapshot before Flare sends `finish_reason` and `[DONE]`, and that copy lost to other requests' decode. Two long Qwen Code sessions at 265-325K tokens stalled: a finished `compress` reply waited 16.6 h and came back only when the other session's turn was cancelled. With the patch, `scripts/check_response_completion.py` closes a short reply 2.5 ms after its last token while a long one keeps decoding. The package does not need a new export. |
 
 ## Three settings that decide the speed
 
@@ -186,7 +187,7 @@ Flare update that changes the package format.
 bin/launch-rank                 one rank: flare run with the recipe's settings; rank 0 adds HTTP and the TLS front
 bin/tls-front.py                TLS on :8888, video parts become frames
 bin/dsv41_video_frames.py       the frame sampler (from the vLLM recipe)
-patches/                        0001-0004 for Flare 5f37bd1 (see NOTICE)
+patches/                        0001-0005 for Flare 5f37bd1 (see NOTICE)
 scripts/build-flare.sh          build patched Flare on one node
 scripts/fetch.sh                checkpoint to rank 0, then make-flare-checkpoint.py
 scripts/make-flare-checkpoint.py   exact E2M1 -> E4M3 widening of the Engram tables into a view directory

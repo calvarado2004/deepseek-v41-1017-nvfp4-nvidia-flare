@@ -3,12 +3,13 @@ Copyright (c) 2026 Carlos Alvarado Martinez — MIT, see LICENSE.
 
 This repository includes third-party material under its own licenses:
 
-- patches/0001-0004: changes to NVIDIA/flare-local-inference (Apache-2.0) at
+- patches/0001-0005: changes to NVIDIA/flare-local-inference (Apache-2.0) at
   5f37bd14062334f7687d168d58ea00567b9aa7fe; they are Apache-2.0 like the code
   they change.
   - 0002 is the fix dbotwinick posted on NVIDIA/flare-local-inference#2.
   - 0003 copies the RoCE proxy ABI 10 sources from FlashInfer (Apache-2.0) at
     03de0b66, the revision Flare locks (NVIDIA/flare-local-inference#7).
+  - 0005 is Martin Vit's NVIDIA/flare-local-inference#75, ported to the pin.
 - bin/dsv41_video_frames.py: from calvarado2004/deepseek-v41-1017-nvfp4 (MIT,
   same author), unchanged.
 - assets/deepseek-logo.svg: from Wikimedia Commons, MIT, originally published
