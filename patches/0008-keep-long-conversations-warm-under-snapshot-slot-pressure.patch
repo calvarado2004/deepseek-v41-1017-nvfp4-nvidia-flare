@@ -1,0 +1,693 @@
+From f2856f1cd74414502cf2429dd494150bd18b77ad Mon Sep 17 00:00:00 2001
+From: Carlos Alvarado Martinez <45523697+calvarado2004@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:00:04 -0400
+Subject: [PATCH] Keep long conversations warm under snapshot-slot pressure
+
+Snapshot slots are fixed at eight per concurrent request, and eviction
+retires the least recently used checkpoint. A coding agent's long
+conversation shares those slots with its subagents and side queries, so a
+few minutes of short requests retire the conversation's endpoint and its
+next turn prefills the whole context again, even with most KV pages free
+(issue #47).
+
+Evict by GreedyDual-Size over the tokens an eviction loses: each checkpoint
+carries the cache inflation at its last use, and its priority adds the span
+a request must recompute once it is gone. A long conversation outlasts many
+short endpoints, while an idle one still ages out as the inflation rises.
+
+Add --prefix-cache-snapshots N to set the slot total. Rows alias KV backing
+and the prepared continuation extent still bounds them, so a large page pool
+can retain more endpoints without a re-export.
+
+qualify/prefix_retention.py runs the scenario against a live server.
+---
+ docs/cli-design.md                      |  13 +-
+ docs/prefix-cache-offload.md            |  13 +-
+ flare/src/cli.rs                        |  15 ++
+ helios/src/cache.rs                     |  38 ++++-
+ helios/src/cache/tests.rs               |  62 +++++++++
+ helios/src/runtime_package/memory.rs    |  43 ++++--
+ helios/src/runtime_package/selection.rs |   2 +
+ helios/src/scheduler/tests.rs           |  42 ++++++
+ qualify/prefix_retention.py             | 178 ++++++++++++++++++++++++
+ 9 files changed, 382 insertions(+), 24 deletions(-)
+ create mode 100644 qualify/prefix_retention.py
+
+diff --git a/docs/cli-design.md b/docs/cli-design.md
+index 7227d298..cfb9dd28 100644
+--- a/docs/cli-design.md
++++ b/docs/cli-design.md
+@@ -974,10 +974,13 @@ value in preference to that recorded reserve.
+ The GPU prefix cache is derived. It holds model states at instruction,
+ prompt, and answer boundaries so that later requests repeating a prefix skip
+ recomputing it. A finished exchange can retain its prompt and answer states, so the
+-engine exposes up to eight snapshot slots per concurrent request, about four
+-recent exchanges each. Snapshot slots share physical backing with KV pages and
+-acquire it only when retaining a checkpoint. Unpinned checkpoints are evicted
+-to admit requests. If active requests or transfers own all suitable backing,
++engine exposes up to eight snapshot slots per concurrent request by default, about
++four recent exchanges each; `--prefix-cache-snapshots N` sets the total, bounded by
++the prepared continuation extent and the memory the agreed pages back. Snapshot
++slots share physical backing with KV pages and acquire it only when retaining a
++checkpoint. Unpinned checkpoints are evicted to admit requests, cheapest to
++recompute first, so a long conversation stays resident while short requests
++cycle through the other slots. If active requests or transfers own all suitable backing,
+ the engine skips optional checkpoint retention. There is no dedicated snapshot
+ memory fraction or minimum resident checkpoint count.
+ 
+@@ -1030,7 +1033,7 @@ decoded-source windows are accounted for separately at startup.
+ | Tensor-parallel size | Count of `--gpus`, or the smallest recipe-supported size whose estimate fits the first GPUs with enough free memory |
+ | Context limit | The smaller of the prepared context ceiling and loaded KV capacity after per-request draft-page storage; admission also checks available shared capacity |
+ | KV pages | Remaining supply after the runtime memory limit or package reserve, engine headroom, weights, graphs, scratch, and execution rows; bounded by `--kv-cache-limit` and prepared virtual extents. Retained snapshot rows borrow page backing; the load display reports total KV capacity |
+-| Prefix cache | Up to eight snapshot slots per `--max-concurrency` request, acquired on demand from shared KV backing and evicted under pressure |
++| Prefix cache | Up to eight snapshot slots per `--max-concurrency` request, or `--prefix-cache-snapshots`, acquired on demand from shared KV backing and evicted under pressure by recompute cost |
+ | Live state | One null row plus the recipe's execution rows per active request slot; GLM verification commits into one live row |
+ | Decode graph capacities | 1 through `--max-concurrency`, rounded to the recipe's captured set |
+ | Image feature arena | Prepared image concurrency times per-request feature capacity and embedding width; slots remain owned through request retirement |
+diff --git a/docs/prefix-cache-offload.md b/docs/prefix-cache-offload.md
+index 769f2eba..d63d18ee 100644
+--- a/docs/prefix-cache-offload.md
++++ b/docs/prefix-cache-offload.md
+@@ -184,9 +184,16 @@ is absent from the host index is stored as a root record holding its complete
+ page chain, so a skipped or evicted ancestor never makes its descendants
+ unrestorable.
+ 
+-Eviction follows `PrefixCheckpointCache::evict`: remove the least recently
+-used unpinned leaf; when every leaf is pinned, compact the least recently used
+-unpinned single-child ancestor by dropping its row and keeping its pages. A
++Eviction follows `PrefixCheckpointCache::evict`: under snapshot pressure alone,
++first compact the unpinned single-child ancestor with the shortest span by
++dropping its row and keeping its pages. Otherwise it applies GreedyDual-Size to
++the tokens an eviction loses. Each checkpoint carries the cache inflation at its
++last use, and its priority adds the tokens a request must recompute once it is
++gone: the span past its parent for an unpinned leaf, nothing for an unpinned
++single-child ancestor, which is compacted. The lowest priority goes first, ties
++by recency, and the evicted priority becomes the new inflation. A long
++conversation's endpoint therefore outlasts many short requests' endpoints, and
++an idle one still ages out. A
+ compacted node stays in the tree as page-only, no longer matches lookups, and
+ continues to supply chain pages. A node is evictable only when its store's
+ policy allows it: the memory store standalone evicts any unpinned node, the
+diff --git a/flare/src/cli.rs b/flare/src/cli.rs
+index 6e06426c..0af8b4e8 100644
+--- a/flare/src/cli.rs
++++ b/flare/src/cli.rs
+@@ -886,6 +886,11 @@ pub struct ServingOptions {
+         value_parser = PossibleValuesParser::new(["staged", "direct"])
+             .map(|value| if value == "staged" { Transport::Staged } else { Transport::Direct }))]
+     pub prefix_cache_disk_transport: Option<Transport>,
++
++    /// GPU prefix checkpoints retained at once; each borrows KV backing only while it holds one
++    /// [default: eight per concurrent request].
++    #[arg(long, value_name = "N", help_heading = "Prefix cache options")]
++    pub prefix_cache_snapshots: Option<NonZeroUsize>,
+ }
+ 
+ fn served_model_name(value: &str) -> Result<String, String> {
+@@ -1024,6 +1029,10 @@ impl ServingOptions {
+         if let Some(bytes) = self.prefix_cache_disk_limit {
+             options.extend(["--prefix-cache-disk-limit".into(), bytes.to_string()]);
+         }
++        // Ranks agree on the smallest slot count, so every rank needs the same value.
++        if let Some(slots) = self.prefix_cache_snapshots {
++            options.extend(["--prefix-cache-snapshots".into(), slots.to_string()]);
++        }
+         if let Some(transport) = self.prefix_cache_disk_transport {
+             options.extend([
+                 "--prefix-cache-disk-transport".into(),
+@@ -1074,6 +1083,7 @@ impl ServingOptions {
+                 disk_limit: self.prefix_cache_disk_limit,
+                 transport: self.prefix_cache_disk_transport,
+             },
++            prefix_cache_snapshots: self.prefix_cache_snapshots.map(NonZeroUsize::get),
+             cluster_rank,
+         }
+     }
+@@ -1777,6 +1787,8 @@ mod tests {
+             "100G",
+             "--prefix-cache-disk-transport",
+             "staged",
++            "--prefix-cache-snapshots",
++            "256",
+         ]);
+         let options = args.rank_options();
+         assert_eq!(
+@@ -1788,6 +1800,8 @@ mod tests {
+                 "/var/cache/flare",
+                 "--prefix-cache-disk-limit",
+                 "107374182400",
++                "--prefix-cache-snapshots",
++                "256",
+                 "--prefix-cache-disk-transport",
+                 "staged",
+             ]
+@@ -1798,6 +1812,7 @@ mod tests {
+             run(&forwarded).load_options().prefix_cache,
+             args.load_options().prefix_cache
+         );
++        assert_eq!(run(&forwarded).load_options().prefix_cache_snapshots, Some(256));
+         assert!(
+             run(&["flare", "run", "model.safetensors"])
+                 .rank_options()
+diff --git a/helios/src/cache.rs b/helios/src/cache.rs
+index 51857793..bcc7a16b 100644
+--- a/helios/src/cache.rs
++++ b/helios/src/cache.rs
+@@ -70,6 +70,8 @@ pub struct Checkpoint {
+     direct_pins: u64,
+     pins: u64,
+     accessed: u64,
++    /// Cache inflation when last used; eviction adds the tokens retiring the checkpoint loses.
++    credit: u64,
+ }
+ 
+ impl Checkpoint {
+@@ -177,6 +179,8 @@ pub struct PrefixCheckpointCache {
+     completed: Fence,
+     next_id: u64,
+     clock: u64,
++    /// GreedyDual-Size inflation: the priority of the last checkpoint evicted as a leaf.
++    inflation: u64,
+ }
+ 
+ impl PrefixCheckpointCache {
+@@ -202,6 +206,7 @@ impl PrefixCheckpointCache {
+             completed: Fence(0),
+             next_id: 1,
+             clock: 0,
++            inflation: 0,
+         })
+     }
+ 
+@@ -310,6 +315,7 @@ impl PrefixCheckpointCache {
+             self.clock = tick;
+             let existing = self.nodes.get_mut(&id).unwrap();
+             existing.accessed = tick;
++            existing.credit = self.inflation;
+             let ready = existing.ready;
+             for ancestor in parent_chain {
+                 let node = self.nodes.get_mut(&ancestor).unwrap();
+@@ -337,6 +343,7 @@ impl PrefixCheckpointCache {
+             direct_pins: 0,
+             pins: 0,
+             accessed: tick,
++            credit: self.inflation,
+         };
+         self.next_id = next_id;
+         self.clock = tick;
+@@ -369,7 +376,9 @@ impl PrefixCheckpointCache {
+                 .clock
+                 .checked_add(1)
+                 .ok_or("cache access clock exhausted")?;
+-            self.nodes.get_mut(&id).unwrap().accessed = self.clock;
++            let node = self.nodes.get_mut(&id).unwrap();
++            node.accessed = self.clock;
++            node.credit = self.inflation;
+         }
+         match selected {
+             None => Ok(Lookup {
+@@ -439,6 +448,19 @@ impl PrefixCheckpointCache {
+         Ok(())
+     }
+ 
++    /// Tokens a request must recompute once this checkpoint is gone, on top of its last-use credit.
++    fn eviction_priority(&self, node: &Checkpoint) -> u64 {
++        let lost = if node.child_count == 0 {
++            node.prefix.consumed_tokens
++                - node
++                    .parent
++                    .map_or(0, |id| self.nodes[&id].prefix.consumed_tokens)
++        } else {
++            0
++        };
++        node.credit.saturating_add(lost)
++    }
++
+     fn retire_leaf(&mut self, id: CheckpointId) -> RetiredResources {
+         let node = self.nodes.remove(&id).unwrap();
+         self.prefixes.remove(&node.prefix);
+@@ -469,6 +491,7 @@ impl PrefixCheckpointCache {
+         pages.append(&mut child.tail_pages);
+         child.tail_pages = pages;
+         child.parent = node.parent;
++        child.credit = child.credit.max(node.credit);
+         // Transferred pages retain outstanding reads from the removed ancestor.
+         child.last_use = child.last_use.max(node.last_use).max(node.ready_after);
+         self.prefixes.remove(&node.prefix);
+@@ -521,16 +544,23 @@ impl PrefixCheckpointCache {
+                         .map(|(node, _)| node.id)
+                 })
+                 .flatten();
++            // GreedyDual-Size over the tokens an eviction loses: a long conversation's endpoint
++            // outlives many short requests' endpoints, yet an idle one still ages out as the
++            // inflation rises. Compacting an ancestor loses no tokens, so it goes first.
+             let candidate = interior.or_else(|| {
+-                self.nodes
++                let (priority, id) = self
++                    .nodes
+                     .values()
+                     .filter(|node| {
+                         node.ready
+                             && ((node.pins == 0 && node.child_count == 0)
+                                 || (node.direct_pins == 0 && node.child_count == 1))
+                     })
+-                    .min_by_key(|node| (node.accessed, node.id))
+-                    .map(|node| node.id)
++                    .map(|node| (self.eviction_priority(node), node))
++                    .min_by_key(|(priority, node)| (*priority, node.accessed, node.id))
++                    .map(|(priority, node)| (priority, node.id))?;
++                self.inflation = self.inflation.max(priority);
++                Some(id)
+             });
+             let Some(id) = candidate else {
+                 break;
+diff --git a/helios/src/cache/tests.rs b/helios/src/cache/tests.rs
+index b77f1ae6..8685ac97 100644
+--- a/helios/src/cache/tests.rs
++++ b/helios/src/cache/tests.rs
+@@ -943,3 +943,65 @@ fn oldest_ancestor_compacts_before_a_newer_unpinned_leaf() {
+         assert_eq!(cache.page_chain(child).unwrap(), [PageId(0), PageId(1)]);
+     }
+ }
++
++/// Evicts one checkpoint at a time while short requests keep eight endpoints live, and returns
++/// how many short endpoints went before the 1,024-token conversation did.
++fn short_evictions_before_the_conversation(renew_after: Option<usize>) -> usize {
++    let mut cache = PrefixCheckpointCache::new([7; 32], 512, 512, 64).unwrap();
++    let conversation = history(16, 0);
++    let main = created(
++        &mut cache,
++        &conversation,
++        &proposal(None, 1024, &(0..16).collect::<Vec<_>>(), 0, 0),
++    );
++    let mut next = 1u32;
++    let mut short = |cache: &mut PrefixCheckpointCache| {
++        created(
++            cache,
++            &history(1, 1000 * next),
++            &proposal(None, 64, &[15 + next], next, 0),
++        );
++        next += 1;
++    };
++    for _ in 0..8 {
++        short(&mut cache);
++    }
++    let mut rounds = 0;
++    loop {
++        let report = cache.evict(EvictionTarget { pages: 0, snapshots: 1 });
++        if report.retired[0].checkpoint == main {
++            assert_eq!(cache.lookup(&conversation).unwrap().checkpoint, None);
++            return rounds;
++        }
++        rounds += 1;
++        if Some(rounds) == renew_after {
++            // A new turn of the conversation renews its credit.
++            assert_eq!(cache.lookup(&conversation).unwrap().checkpoint, Some(main));
++        }
++        short(&mut cache);
++    }
++}
++
++#[test]
++fn a_long_conversation_outlives_short_requests_until_its_credit_ages_out() {
++    // Recency alone retires the conversation first. GreedyDual-Size keeps it while the
++    // inflation climbs one short endpoint's tokens per generation of eight live endpoints.
++    assert_eq!(short_evictions_before_the_conversation(None), (1024 / 64 - 1) * 8);
++    let renewed = short_evictions_before_the_conversation(Some(100));
++    assert!(renewed >= 100 + (1024 / 64 - 1) * 8, "{renewed}");
++}
++
++#[test]
++fn compaction_keeps_the_conversation_credit() {
++    let mut cache = cache();
++    let conversation = history(4, 0);
++    let root = created(&mut cache, &conversation, &proposal(None, 64, &[0], 0, 0));
++    let leaf = created(&mut cache, &conversation, &proposal(Some(root), 256, &[1, 2, 3], 1, 0));
++    let other = created(&mut cache, &history(1, 500), &proposal(None, 64, &[4], 2, 0));
++    // The ancestor loses no tokens and compacts first; the short endpoint goes next.
++    let report = cache.evict(EvictionTarget { pages: 1, snapshots: 0 });
++    assert_eq!(report.retired[0].checkpoint, root);
++    let report = cache.evict(EvictionTarget { pages: 1, snapshots: 0 });
++    assert_eq!(report.retired[0].checkpoint, other);
++    assert_eq!(cache.lookup(&conversation).unwrap().checkpoint, Some(leaf));
++}
+diff --git a/helios/src/runtime_package/memory.rs b/helios/src/runtime_package/memory.rs
+index d5c89d8d..d7c4a175 100644
+--- a/helios/src/runtime_package/memory.rs
++++ b/helios/src/runtime_package/memory.rs
+@@ -280,6 +280,7 @@ fn capacities(
+     width: u64,
+     page_tokens: u64,
+     page_limit: Option<PageLimit>,
++    snapshots: Option<u64>,
+ ) -> Result<(u64, u64, u64)> {
+     if packages.len() != available.len()
+         || packages.is_empty()
+@@ -296,7 +297,9 @@ fn capacities(
+     if minimum_pages == 0 {
+         return Err(invalid("KV cache limit leaves no physical pages"));
+     }
+-    let mut cached = active * 8;
++    // Snapshot rows borrow KV backing only while they hold a checkpoint, so a large page pool can
++    // retain far more than the default: one long session's endpoints, plus its subagents'.
++    let mut cached = snapshots.unwrap_or(active * 8);
+     let mut maximum_pages = page_limit.map_or(u64::MAX, |limit| limit.maximum);
+     for (rank, (package, &budget)) in packages.iter().zip(available).enumerate() {
+         let rows: Vec<_> = package
+@@ -630,6 +633,7 @@ impl NativeModel {
+             width,
+             page_tokens,
+             ceiling,
++            options.prefix_cache_snapshots.map(|n| n as u64),
+         )?;
+         // Fewer pages only shrink KV, and fewer rows only the snapshot slots aliased into it, so
+         // the smallest capacity any rank can back fits every rank. Snapshot rows need no
+@@ -1224,9 +1228,9 @@ mod tests {
+     fn lower_concurrency_and_verification_move_physical_budget_to_kv() {
+         let p = [package(100 << 20, 2 << 20, 100000)];
+         let budget = [80 << 30];
+-        let full = capacities(&p, &budget, 32, 6, 64, None).unwrap();
+-        let reduced = capacities(&p, &budget, 4, 6, 64, None).unwrap();
+-        let target_only = capacities(&p, &budget, 4, 1, 64, None).unwrap();
++        let full = capacities(&p, &budget, 32, 6, 64, None, None).unwrap();
++        let reduced = capacities(&p, &budget, 4, 6, 64, None, None).unwrap();
++        let target_only = capacities(&p, &budget, 4, 1, 64, None, None).unwrap();
+         assert!(full.0 > reduced.0 && reduced.0 > target_only.0);
+         assert!(full.1 < reduced.1 && reduced.1 < target_only.1);
+         assert_eq!(reduced.0, 1 + 4 * 6 + reduced.2);
+@@ -1235,21 +1239,36 @@ mod tests {
+             assert!(used <= budget[0] && budget[0] - used < 2 << 20);
+         }
+         // Capture concurrency is deliberately absent from the allocation policy.
+-        assert_eq!(reduced, capacities(&p, &budget, 4, 6, 64, None).unwrap());
++        assert_eq!(reduced, capacities(&p, &budget, 4, 6, 64, None, None).unwrap());
++    }
++
++    #[test]
++    fn requested_snapshot_slots_alias_kv_without_shrinking_the_page_pool() {
++        let p = [package(65536, 1 << 20, 100000)];
++        let budget = [16 << 30];
++        let default = capacities(&p, &budget, 4, 6, 64, None, None).unwrap();
++        assert_eq!(default.2, 32);
++        let requested = capacities(&p, &budget, 4, 6, 64, None, Some(256)).unwrap();
++        assert_eq!(requested.2, 256);
++        assert_eq!(requested.1, default.1);
++        assert_eq!(requested.0 - requested.2, default.0 - default.2);
++        // The prepared virtual extent still bounds the rows.
++        let capped = capacities(&p, &budget, 4, 6, 64, None, Some(1 << 20)).unwrap();
++        assert!(capped.0 <= 4096 && capped.2 > 256);
+     }
+ 
+     #[test]
+     fn ranks_share_capacities_and_respect_alignment_and_virtual_extents() {
+         let p = [package(123456, 45678, 1000), package(246912, 91356, 1000)];
+         let (rows, pages, snapshots) =
+-            capacities(&p, &[256 << 20, 80 << 20], 4, 3, 256, None).unwrap();
++            capacities(&p, &[256 << 20, 80 << 20], 4, 3, 256, None, None).unwrap();
+         assert!(pages <= 1000);
+         for (p, budget) in p.iter().zip([256 << 20, 80 << 20]) {
+             assert!(bytes(p, 0, rows - snapshots).unwrap() + bytes(p, 1, pages).unwrap() <= budget);
+         }
+-        assert!(capacities(&p, &[256 << 20, 1 << 20], 4, 3, 256, None).is_err());
++        assert!(capacities(&p, &[256 << 20, 1 << 20], 4, 3, 256, None, None).is_err());
+         let (_, pages, _) =
+-            capacities(&[package(1024, 1024, 1024)], &[1 << 30], 1, 1, 64, None).unwrap();
++            capacities(&[package(1024, 1024, 1024)], &[1 << 30], 1, 1, 64, None, None).unwrap();
+         assert_eq!(pages, 1024);
+     }
+ 
+@@ -1265,17 +1284,17 @@ mod tests {
+         });
+         for width in [1, 6] {
+             let (rows, pages, snapshots) =
+-                capacities(&packages, &[1 << 30, 1 << 30], 4, width, 64, limit).unwrap();
++                capacities(&packages, &[1 << 30, 1 << 30], 4, width, 64, limit, None).unwrap();
+             assert_eq!(pages, 16);
+             assert_eq!(rows - snapshots, 1 + 4 * width);
+             // A busy TP rank reduces the common pool. Context mode still starts with fewer
+             // pages than a full context when the usable memory budget requires it.
+             let (_, pages, _) =
+-                capacities(&packages, &[1 << 30, 20 << 20], 4, width, 64, limit).unwrap();
++                capacities(&packages, &[1 << 30, 20 << 20], 4, width, 64, limit, None).unwrap();
+             assert!((4..16).contains(&pages));
+         }
+-        assert!(capacities(&packages, &[1 << 30, 1 << 20], 4, 6, 64, limit).is_err());
+-        assert!(capacities(&packages, &[1 << 30, 20 << 20], 4, 6, 64, None).is_err());
++        assert!(capacities(&packages, &[1 << 30, 1 << 20], 4, 6, 64, limit, None).is_err());
++        assert!(capacities(&packages, &[1 << 30, 20 << 20], 4, 6, 64, None, None).is_err());
+     }
+ 
+     #[test]
+diff --git a/helios/src/runtime_package/selection.rs b/helios/src/runtime_package/selection.rs
+index 777b095b..32ad7443 100644
+--- a/helios/src/runtime_package/selection.rs
++++ b/helios/src/runtime_package/selection.rs
+@@ -30,6 +30,8 @@ pub struct LoadOptions {
+     /// User-visible ordinals when the launcher renumbers CUDA devices.
+     pub device_labels: Option<Vec<i32>>,
+     pub prefix_cache: crate::offload::PrefixCacheOffload,
++    /// GPU prefix checkpoints retained at once; absent selects eight per concurrent request.
++    pub prefix_cache_snapshots: Option<usize>,
+     /// For a package whose ranks run on separate hosts: the one rank this host loads.
+     pub cluster_rank: Option<usize>,
+ }
+diff --git a/helios/src/scheduler/tests.rs b/helios/src/scheduler/tests.rs
+index d5e2c36e..b4787387 100644
+--- a/helios/src/scheduler/tests.rs
++++ b/helios/src/scheduler/tests.rs
+@@ -897,6 +897,48 @@ fn appended_conversation_outlives_snapshot_capacity_without_losing_prefix_pages(
+     assert_eq!(scheduler.free_snapshot_count(), 3);
+ }
+ 
++/// Serves one request whose prompt extends at most one prefill chunk past its cached prefix,
++/// publishes its terminal checkpoint, and returns the tokens admission reused.
++fn serve_to_checkpoint(scheduler: &mut RequestScheduler, prompt: Vec<u32>, fence: &mut u64) -> u64 {
++    let tokens = prompt.len();
++    let handle = scheduler
++        .admit(RequestSpec { prompt, ..spec(0, 1) })
++        .unwrap();
++    let reused = scheduler.request(handle).unwrap().consumed_tokens;
++    *fence += 1;
++    init(scheduler, *fence);
++    *fence += 1;
++    let step = scheduler.plan().unwrap();
++    assert_eq!(step.kind, GraphKind::Prefill);
++    scheduler.commit(&step, Fence(*fence)).unwrap();
++    scheduler
++        .complete(
++            Fence(*fence),
++            &records(handle, *fence, tokens as i64, 1, 77, 2),
++            Default::default(),
++        )
++        .unwrap();
++    *fence += 1;
++    freeze(scheduler, handle, *fence);
++    scheduler.finish(handle).unwrap().unwrap();
++    reused
++}
++
++#[test]
++fn long_conversation_stays_warm_while_short_requests_churn_snapshot_slots() {
++    // Three slots, as a coding agent's main conversation shares them with its subagents.
++    let mut scheduler = scheduler(1, 64, 3);
++    let mut fence = 0;
++    assert_eq!(serve_to_checkpoint(&mut scheduler, (0..512).collect(), &mut fence), 0);
++    for request in 1..=6u32 {
++        let prompt = (request * 10_000..request * 10_000 + 64).collect();
++        assert_eq!(serve_to_checkpoint(&mut scheduler, prompt, &mut fence), 0);
++    }
++    assert!(scheduler.stats().snapshot_evictions >= 4);
++    // The follow-up turn resumes from the conversation's endpoint instead of prefilling it again.
++    assert_eq!(serve_to_checkpoint(&mut scheduler, (0..576).collect(), &mut fence), 512);
++}
++
+ #[test]
+ fn branching_requests_own_distinct_tail_pages_and_terminal_snapshots() {
+     let mut scheduler = scheduler(2, 8, 5);
+diff --git a/qualify/prefix_retention.py b/qualify/prefix_retention.py
+new file mode 100644
+index 00000000..6e1d7f8e
+--- /dev/null
++++ b/qualify/prefix_retention.py
+@@ -0,0 +1,178 @@
++"""GPU prefix retention qualification: one long conversation must stay warm while
++many short conversations churn the snapshot slots, as a coding agent's main
++session does while its subagents and side queries run.
++
++The scenario publishes a long conversation, then runs more short conversations
++than the server has snapshot slots, each a few turns long with its own system
++prompt, and finally sends the long conversation's next turn. The follow-up must
++reuse the conversation's prefix from the GPU cache: its cached tokens must cover
++the previous turn's prompt, and it must answer a fact from the start of the
++conversation. With least-recently-used eviction the short conversations retire
++the long conversation's endpoint and the follow-up prefills it again.
++
++Run against a serving rank zero, or let the script launch `flare run`:
++
++    python3 -m qualify.prefix_retention --url http://127.0.0.1:8000 --conversation-tokens 300000
++    python3 -m qualify.prefix_retention --flare flare/target/release/flare \\
++        --package /data/model.safetensors --gpus 0 --artifacts /data/prefix-retention
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import random
++import re
++import time
++import urllib.request
++from pathlib import Path
++
++WORDS = (
++    "amber basil cedar delta ember fjord garnet harbor indigo juniper kestrel lantern "
++    "meadow nectar orchid pepper quartz raven saffron tundra umber violet willow xenon "
++    "yarrow zephyr"
++).split()
++
++
++def metrics(url: str) -> dict[str, float]:
++    with urllib.request.urlopen(url + "/metrics", timeout=10) as response:
++        text = response.read().decode()
++    values = {}
++    for line in text.splitlines():
++        match = re.match(r"^(flare_[a-z_]+) ([0-9.e+-]+)$", line)
++        if match:
++            values[match[1]] = float(match[2])
++    return values
++
++
++def model_id(url: str) -> str:
++    with urllib.request.urlopen(url + "/v1/models", timeout=10) as response:
++        return json.load(response)["data"][0]["id"]
++
++
++def complete(url: str, model: str, messages: list[dict], template: dict | None, timeout: float) -> dict:
++    body = {"model": model, "messages": messages, "max_tokens": 32, "temperature": 0}
++    if template:
++        body["chat_template_kwargs"] = template
++    request = urllib.request.Request(
++        url + "/v1/chat/completions",
++        data=json.dumps(body).encode(),
++        headers={"Content-Type": "application/json"},
++    )
++    start = time.monotonic()
++    with urllib.request.urlopen(request, timeout=timeout) as response:
++        result = json.load(response)
++    usage = result["usage"]
++    return {
++        "seconds": time.monotonic() - start,
++        "prompt_tokens": usage["prompt_tokens"],
++        "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
++        "text": result["choices"][0]["message"].get("content") or "",
++    }
++
++
++def filler(rng: random.Random, words: int) -> str:
++    return " ".join(rng.choice(WORDS) for _ in range(words))
++
++
++def conversation(rng: random.Random, tokens: int, secret: str) -> list[dict]:
++    """A long conversation of several turns whose first user message holds the secret."""
++    turns = 8
++    # Roughly one token per filler word, plus separators.
++    per_turn = max(64, tokens // turns)
++    messages = [
++        {"role": "system", "content": "You are a careful assistant reviewing a long log."},
++        {"role": "user", "content": f"Remember this access code: {secret}. Log part 1: {filler(rng, per_turn)}"},
++        {"role": "assistant", "content": "Noted. Send the next part."},
++    ]
++    for part in range(2, turns + 1):
++        if part > 2:
++            messages.append({"role": "assistant", "content": "Noted. Send the next part."})
++        messages.append({"role": "user", "content": f"Log part {part}: {filler(rng, per_turn)}"})
++    return messages
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--url", help="A serving rank zero; omit to launch --flare")
++    parser.add_argument("--flare", type=Path)
++    parser.add_argument("--package", type=Path)
++    parser.add_argument("--gpus", default="0")
++    parser.add_argument("--port", type=int, default=18431)
++    parser.add_argument("--artifacts", type=Path, default=Path("prefix-retention"))
++    parser.add_argument("--extra", default="", help="Additional `flare run` flags for a launched server")
++    parser.add_argument("--conversation-tokens", type=int, default=32768)
++    parser.add_argument("--side-tokens", type=int, default=2048)
++    parser.add_argument("--side-turns", type=int, default=3)
++    parser.add_argument("--side-conversations", type=int, default=0,
++                        help="Short conversations; zero selects twice the server's snapshot slots")
++    parser.add_argument("--chat-template-kwargs", type=json.loads, default=None,
++                        help='JSON, e.g. \'{"enable_thinking": false}\'')
++    parser.add_argument("--timeout", type=float, default=3600)
++    parser.add_argument("--seed", type=int, default=20261025)
++    args = parser.parse_args()
++
++    server = None
++    if args.url:
++        url = args.url.rstrip("/")
++    else:
++        if not (args.flare and args.package):
++            parser.error("give --url, or --flare and --package")
++        from qualify.host_cache import Server
++
++        args.artifacts.mkdir(parents=True, exist_ok=True)
++        server = Server(args.flare, args.package, args.gpus, args.port,
++                        args.artifacts / "server.log", args.extra.split())
++        server.wait_ready(args.timeout)
++        url = server.url
++    try:
++        return run(url, args)
++    finally:
++        if server is not None:
++            server.stop()
++
++
++def run(url: str, args: argparse.Namespace) -> int:
++    rng = random.Random(args.seed)
++    model = model_id(url)
++    before = metrics(url)
++    slots = int(before.get("flare_free_snapshots", 0) + before.get("flare_cached_checkpoints", 0))
++    sides = args.side_conversations or max(8, 2 * slots)
++    secret = f"{rng.randrange(10**8):08d}"
++    messages = conversation(rng, args.conversation_tokens, secret)
++    report: dict = {"model": model, "snapshot_slots": slots, "side_conversations": sides}
++
++    first = complete(url, model, messages, args.chat_template_kwargs, args.timeout)
++    report["first"] = first
++    print(f"conversation: {first['prompt_tokens']} prompt tokens, {first['cached_tokens']} cached, "
++          f"{first['seconds']:.1f} s", flush=True)
++    messages.append({"role": "assistant", "content": first["text"]})
++
++    for side in range(sides):
++        thread = [{"role": "system", "content": f"You are subagent {side}. {filler(rng, 64)}"}]
++        for turn in range(args.side_turns):
++            thread.append({"role": "user", "content": f"Task {side}.{turn}: {filler(rng, args.side_tokens // args.side_turns)}"})
++            result = complete(url, model, thread, args.chat_template_kwargs, args.timeout)
++            thread.append({"role": "assistant", "content": result["text"]})
++    churn = metrics(url)
++    report["side_snapshot_evictions"] = churn.get("flare_snapshot_evictions_total", 0) - before.get("flare_snapshot_evictions_total", 0)
++    print(f"side conversations: {sides} x {args.side_turns} turns, "
++          f"{report['side_snapshot_evictions']:.0f} snapshot evictions", flush=True)
++
++    messages.append({"role": "user", "content": "What was the access code I asked you to remember? Reply with the digits only."})
++    follow = complete(url, model, messages, args.chat_template_kwargs, args.timeout)
++    report["follow_up"] = follow
++    covered = follow["cached_tokens"] >= first["prompt_tokens"]
++    recalled = secret in follow["text"]
++    print(f"follow-up: {follow['prompt_tokens']} prompt tokens, {follow['cached_tokens']} cached, "
++          f"{follow['seconds']:.1f} s (first turn {first['seconds']:.1f} s), answer {follow['text']!r}", flush=True)
++    report["passed"] = covered and recalled
++    args.artifacts.mkdir(parents=True, exist_ok=True)
++    (args.artifacts / "prefix_retention.json").write_text(json.dumps(report, indent=2) + "\n")
++    print("PASS" if report["passed"] else
++          f"FAIL: {'prefix not reused' if not covered else ''} {'' if recalled else 'access code not recalled'}".strip())
++    return 0 if report["passed"] else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+-- 
+2.43.0
+

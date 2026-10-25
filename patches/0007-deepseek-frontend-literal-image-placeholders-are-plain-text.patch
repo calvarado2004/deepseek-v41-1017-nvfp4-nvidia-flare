@@ -1,0 +1,331 @@
+From 337957565b81959399305e7454cff126ec1db3d9 Mon Sep 17 00:00:00 2001
+From: Carlos Alvarado Martinez <45523697+calvarado2004@users.noreply.github.com>
+ <45523697+calvarado2004@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:18:49 -0400
+Subject: [PATCH] deepseek frontend: literal image placeholders in request text
+ are plain text
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An agent that reads a DeepSeek tokenizer, chat template or recipe source puts
+"<｜image｜>" or "<｜deepseek_image｜>" into a tool result. The frontend rejected
+any request text with either spelling (HTTP 400, "literal DeepSeek image
+placeholder is ambiguous"), and because the history keeps that text, every
+later turn of the session failed while new sessions worked (a Qwen Code
+session at 155K tokens, 2026-10-25).
+
+Render such text escaped instead: each fullwidth bar of a literal spelling
+becomes U+E07C, which has the same UTF-8 length, so the encoder's message and
+checkpoint offsets stay exact. Only image_url parts produce placeholders. The
+tokens of an escaped literal are the plain text it stands for, split before
+the closing bar so that no special token matches, and the rendered text
+carries the literal again. Request text containing U+E07C is rejected.
+---
+ helios/src/frontend/deepseek.rs   | 126 ++++++++++++++++++++++++++++--
+ helios/tests/deepseek_encoder.rs  |  19 +++--
+ helios/tests/deepseek_requests.rs |  96 +++++++++++++++++++++++
+ 3 files changed, 226 insertions(+), 15 deletions(-)
+
+diff --git a/helios/src/frontend/deepseek.rs b/helios/src/frontend/deepseek.rs
+index b58f4d90..92b0f839 100644
+--- a/helios/src/frontend/deepseek.rs
++++ b/helios/src/frontend/deepseek.rs
+@@ -16,6 +16,82 @@ pub(super) fn invalid(message: impl Into<String>) -> Error {
+     Error::frontend(FrontendError::Input(Failure::new(message.into())))
+ }
+ 
++/// Stands for the fullwidth bar of a literal image placeholder while the conversation is
++/// rendered. U+FF5C and U+E07C both encode to three UTF-8 bytes, so escaping keeps every
++/// byte offset that the encoder reports.
++const LITERAL_BAR: char = '\u{E07C}';
++
++/// Placeholder spellings that request text can carry literally (a tool result that read a
++/// tokenizer, chat template or recipe source): the recipe's image marker and the package's
++/// placeholder token. Each pairs with its escaped form; a spelling without a fullwidth bar
++/// cannot be escaped and keeps the rejection below.
++fn literal_placeholders(frontend: &Frontend) -> Vec<(String, String)> {
++    let mut names = vec![IMAGE_SPECIAL_TOKEN.to_owned()];
++    if let Some(marker) = frontend
++        .image_placeholder_token_id
++        .and_then(|id| frontend.tokenizer.id_to_token(id))
++        .filter(|marker| !names.contains(marker))
++    {
++        names.push(marker);
++    }
++    names
++        .into_iter()
++        .map(|name| (name.replace('｜', &LITERAL_BAR.to_string()), name))
++        .filter(|(escaped, name)| escaped != name)
++        .collect()
++}
++
++fn escape_literals(value: &Json, literals: &[(String, String)]) -> Json {
++    match value {
++        Json::String(text) => Json::String(literals.iter().fold(text.clone(), |text, (escaped, name)| {
++            text.replace(name.as_str(), escaped)
++        })),
++        Json::Array(values) => Json::Array(values.iter().map(|v| escape_literals(v, literals)).collect()),
++        Json::Object(map) => Json::Object(
++            map.iter()
++                .map(|(key, v)| (key.clone(), escape_literals(v, literals)))
++                .collect(),
++        ),
++        _ => value.clone(),
++    }
++}
++
++/// Tokenize one span between image placeholders. Escaped literals encode as the plain text
++/// they stand for, split before the closing bar so that no special token can match.
++fn encode_text(
++    frontend: &Frontend,
++    span: &str,
++    literals: &[(String, String)],
++    byte_start: usize,
++    token_ids: &mut Vec<u32>,
++    offsets: &mut Vec<(usize, usize)>,
++) -> Result<()> {
++    let mut pieces = Vec::new();
++    let mut rest = (0, span);
++    while let Some((at, escaped, name)) = literals
++        .iter()
++        .filter_map(|(escaped, name)| rest.1.find(escaped.as_str()).map(|at| (at, escaped, name)))
++        .min_by_key(|&(at, ..)| at)
++    {
++        let start = rest.0 + at;
++        pieces.push((rest.0, &rest.1[..at]));
++        let cut = name.rfind('｜').unwrap();
++        pieces.push((start, &name[..cut]));
++        pieces.push((start + cut, &name[cut..]));
++        rest = (start + escaped.len(), &rest.1[at + escaped.len()..]);
++    }
++    pieces.push(rest);
++    for (start, text) in pieces.into_iter().filter(|(_, text)| !text.is_empty()) {
++        let encoding = frontend.tokenizer.encode(text, false).map_err(|error| {
++            Error::frontend(FrontendError::Tokenizer(Failure::boxed(error.to_string(), error)))
++        })?;
++        token_ids.extend_from_slice(encoding.get_ids());
++        let base = byte_start + start;
++        offsets.extend(encoding.get_offsets().iter().map(|&(s, e)| (base + s, base + e)));
++    }
++    Ok(())
++}
++
+ fn content(value: &Json, hints: &[Json]) -> Result<(String, Vec<ImageSource>, Vec<usize>)> {
+     if value.is_null() {
+         return Ok((String::new(), vec![], vec![]));
+@@ -87,6 +163,38 @@ fn conversation(
+     frontend: &Frontend,
+     messages: &[Json],
+     options: &Map<String, Json>,
++) -> Result<(Conversation, Vec<(usize, usize)>, Option<u8>)> {
++    let supplied_text = format!(
++        "{}{}",
++        serde_json::to_string(&messages).unwrap(),
++        options
++            .get("tools")
++            .map(Json::to_string)
++            .unwrap_or_default()
++    );
++    if supplied_text.contains(LITERAL_BAR) {
++        return Err(invalid(
++            "U+E07C is reserved for literal DeepSeek image placeholders",
++        ));
++    }
++    let literals = literal_placeholders(frontend);
++    if !literals.iter().any(|(_, name)| supplied_text.contains(name.as_str())) {
++        return escaped_conversation(frontend, messages, options);
++    }
++    // Literal placeholder text is ordinary input: render it escaped, so that only
++    // image_url parts produce placeholders; render() restores the text.
++    let messages: Vec<Json> = messages.iter().map(|m| escape_literals(m, &literals)).collect();
++    let mut options = options.clone();
++    if let Some(tools) = options.get_mut("tools") {
++        *tools = escape_literals(tools, &literals);
++    }
++    escaped_conversation(frontend, &messages, &options)
++}
++
++fn escaped_conversation(
++    frontend: &Frontend,
++    messages: &[Json],
++    options: &Map<String, Json>,
+ ) -> Result<(Conversation, Vec<(usize, usize)>, Option<u8>)> {
+     if messages.is_empty() {
+         return Err(invalid("cannot encode an empty conversation"));
+@@ -469,27 +577,31 @@ pub(super) fn render(
+                 invalid("image inputs require a prepared image placeholder token ID")
+             })?)
+         };
++    let literals = literal_placeholders(frontend);
+     for (index, span) in spans.into_iter().enumerate() {
+         if index != 0 {
+             token_ids.push(placeholder.unwrap());
+             offsets.push((byte_start, byte_start + IMAGE_SPECIAL_TOKEN.len()));
+             byte_start += IMAGE_SPECIAL_TOKEN.len();
+         }
+-        let encoding = frontend.tokenizer.encode(span, false).map_err(|error| {
+-            Error::frontend(FrontendError::Tokenizer(Failure::boxed(error.to_string(), error)))
+-        })?;
+-        token_ids.extend_from_slice(encoding.get_ids());
+-        offsets.extend(encoding.get_offsets().iter().map(|&(start,end)| (byte_start+start,byte_start+end)));
++        encode_text(frontend, span, &literals, byte_start, &mut token_ids, &mut offsets)?;
+         byte_start += span.len();
+     }
++    let text = if rendered.prompt.contains(LITERAL_BAR) {
++        literals
++            .iter()
++            .fold(rendered.prompt, |text, (escaped, name)| text.replace(escaped.as_str(), name))
++    } else {
++        rendered.prompt
++    };
+     let message_boundaries = super::boundaries::token_ends(
+         &rendered.message_boundaries,
+         &rendered.checkpoint_hints,
+         &offsets,
+-        rendered.prompt.len(),
++        text.len(),
+     )?;
+     Ok(RenderedPrompt {
+-        text: rendered.prompt,
++        text,
+         token_ids,
+         image_sources,
+         image_checkpoint_hints: Vec::new(),
+diff --git a/helios/tests/deepseek_encoder.rs b/helios/tests/deepseek_encoder.rs
+index 531d5ed1..fe2ab3e2 100644
+--- a/helios/tests/deepseek_encoder.rs
++++ b/helios/tests/deepseek_encoder.rs
+@@ -462,14 +462,17 @@ fn canonical_tool_order_controls_image_sources_and_placeholder_ids() {
+         assert!(scored.token_ids.starts_with(&prefix.token_ids));
+         assert!(scored.message_boundaries.contains(&prefix.token_ids.len()));
+     }
+-    for messages in [
+-        vec![json!({"role":"user","content":"<｜image｜>"})],
+-        vec![
+-            json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}),
+-        ],
+-    ] {
+-        assert!(frontend.render_chat(&messages, &Map::new()).is_err());
+-    }
++    // A literal placeholder in text is text: no image source and no placeholder token.
++    let literal = frontend
++        .render_chat(&[json!({"role":"user","content":"<｜image｜>"})], &Map::new())
++        .unwrap();
++    assert!(literal.image_sources.is_empty());
++    assert!(literal.text.contains("<｜image｜>"));
++    assert!(!literal.token_ids.contains(&frontend.image_placeholder_token_id().unwrap()));
++    let remote = vec![
++        json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}),
++    ];
++    assert!(frontend.render_chat(&remote, &Map::new()).is_err());
+ }
+ 
+ #[test]
+diff --git a/helios/tests/deepseek_requests.rs b/helios/tests/deepseek_requests.rs
+index 4680705f..b7d4b567 100644
+--- a/helios/tests/deepseek_requests.rs
++++ b/helios/tests/deepseek_requests.rs
+@@ -646,3 +646,99 @@ fn decision_generation_prompt_prepares_a_nonthinking_first_assistant_token() {
+         assert_eq!(prepared.output.content.start, OutputStart::Content);
+     }
+ }
++
++/// A Qwen Code turn that read DeepSeek's recipe source: the tool result and the call
++/// arguments spell both image placeholders literally.
++fn literal_placeholder_session(bar: &str) -> Value {
++    let image = format!("<{bar}image{bar}>");
++    let marker = format!("<{bar}deepseek_image{bar}>");
++    json!([
++        {"role":"system","content":"Policy"},
++        {"role":"user","content":format!("Where is {image} defined?")},
++        {"role":"assistant","tool_calls":[{"id":"read","type":"function","function":{"name":"grep",
++            "arguments":json!({"pattern":image}).to_string()}}]},
++        {"role":"tool","tool_call_id":"read","content":format!(
++            "pub const IMAGE_SPECIAL_TOKEN: &str = \"{image}\";\n// placeholder token {marker}")},
++        {"role":"user","content":"Quote it."}
++    ])
++}
++
++#[test]
++fn literal_image_placeholders_are_plain_text() {
++    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
++        let f = Fixture::new(encoder);
++        let placeholder = f.frontend.image_placeholder_token_id().unwrap();
++        let tools = json!([{"type":"function","function":{"name":"grep",
++            "description":"Search for <｜image｜> and <｜deepseek_image｜>","parameters":{"type":"object"}}}]);
++        let prepared = f
++            .prepare(json!({"messages":literal_placeholder_session("｜"),"tools":tools}))
++            .unwrap();
++        for literal in ["<｜image｜>", "<｜deepseek_image｜>"] {
++            assert!(prepared.rendered_prompt.contains(literal), "{encoder:?} {literal}");
++        }
++        assert!(!prepared.rendered_prompt.contains('\u{E07C}'));
++        assert!(!prepared.prompt.tokens.contains(&placeholder), "{encoder:?}");
++        assert_eq!(
++            f.frontend.decode(&prepared.prompt.tokens, false).unwrap(),
++            prepared.rendered_prompt,
++            "{encoder:?}"
++        );
++    }
++}
++
++#[test]
++fn literal_image_placeholders_keep_message_boundaries() {
++    // Each fullwidth bar is three bytes, and the fixture spends one token per byte, so
++    // three ASCII bytes in its place must give the same token positions.
++    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
++        let f = Fixture::new(encoder);
++        let options = Map::new();
++        let literal = f
++            .frontend
++            .render_chat(literal_placeholder_session("｜").as_array().unwrap(), &options)
++            .unwrap();
++        let ascii = f
++            .frontend
++            .render_chat(literal_placeholder_session("|||").as_array().unwrap(), &options)
++            .unwrap();
++        assert_eq!(literal.token_ids.len(), ascii.token_ids.len(), "{encoder:?}");
++        assert_eq!(literal.message_boundaries, ascii.message_boundaries, "{encoder:?}");
++        assert!(!literal.message_boundaries.is_empty());
++        assert_eq!(literal.text.replace('｜', "|||"), ascii.text.replace('｜', "|||"));
++    }
++}
++
++#[test]
++fn literal_image_placeholders_leave_image_parts_alone() {
++    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
++        let f = Fixture::new(encoder);
++        let placeholder = f.frontend.image_placeholder_token_id().unwrap();
++        let messages = json!([{"role":"user","content":[
++            {"type":"text","text":"Compare <｜image｜> and <｜deepseek_image｜> with"},
++            {"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}
++        ]}]);
++        let rendered = f
++            .frontend
++            .render_chat(messages.as_array().unwrap(), &Map::new())
++            .unwrap();
++        assert_eq!(rendered.image_sources.len(), 1, "{encoder:?}");
++        assert_eq!(
++            rendered.token_ids.iter().filter(|&&id| id == placeholder).count(),
++            1,
++            "{encoder:?}"
++        );
++        assert!(rendered.text.contains("Compare <｜image｜> and <｜deepseek_image｜> with"));
++    }
++}
++
++#[test]
++fn reserved_literal_bar_is_rejected() {
++    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
++        let f = Fixture::new(encoder);
++        let error = f
++            .prepare(json!({"messages":[{"role":"user","content":"a \u{E07C} b"}]}))
++            .err()
++            .expect("reserved character accepted");
++        assert!(error.to_string().contains("U+E07C"), "{encoder:?}: {error}");
++    }
++}
+-- 
+2.43.0
+

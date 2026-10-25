@@ -6,19 +6,21 @@
 #   rank 0 -> rank 1 -> rank 2 -> rank 3 -> rank 0 (one QSFP cable each)
 #
 # Engine: Flare (Helios runtime) at pins.env FLARE_COMMIT plus ../patches, running the
-# signed package that scripts/export.sh wrote. This is Flare's documented manual mode
-# (docs/multi-host.md, "Start ranks manually"): the same command line the Flare agent
-# gives each rank, so one systemd unit holds one rank and its journal holds the log.
+# signed package that scripts/export.sh published in rank 0's model cache. This is
+# Flare's documented manual mode (docs/multi-host.md, "Start ranks manually"): rank 0
+# serves the cache entry in place and sends each peer its ranges over the fabric at
+# start; a peer keeps them in its own model cache, so only the first start after an
+# export moves data. One systemd unit holds one rank and its journal holds the log.
 # Rank 0 also serves HTTP on 127.0.0.1:8001 and runs the TLS front on :8888 (Flare
 # speaks plain HTTP only).
 #
 # Rendezvous on the fabric (DSV41F_MASTER_ADDR): the per-step control stream between
 # the ranks. On Wi-Fi it cost 37-61 ms a decode round and halved the speed.
 #
-# Trust: the package is signed by your local development key. scripts/distribute.sh
-# accepts it once and leaves its public profile in ~/.cache/flare/publishers on every
-# node; --dangerously-approve-key pins that exact fingerprint, as the agent does for
-# its ranks (docs/cli-design.md, signing and local development).
+# Trust: the package is signed by your local development key. scripts/publisher.sh
+# copies its public profile to ~/.cache/flare/publishers on every node;
+# --dangerously-approve-key pins that exact fingerprint, as the agent does for its
+# ranks (docs/cli-design.md, signing and local development).
 
 set -euo pipefail
 
@@ -28,10 +30,9 @@ fi
 NODE_RANK="$1"
 
 RUNTIME_ROOT="${DSV41F_RUNTIME_ROOT:-/opt/spark-llm/profiles/deepseek-v41-1017-flare}"
-FLARE="${DSV41F_FLARE:-$RUNTIME_ROOT/src/flare/target/release/flare}"
-PACKAGE_NAME="${DSV41F_PACKAGE_NAME:-dsv41-1017-official-tp4ring-c4-dspark5-csf}"
-PACKAGE_DIR="${DSV41F_PACKAGE_DIR:-/srv/spark-llm/flare-runtime}"
-PACKAGE_ID="${DSV41F_PACKAGE_ID:-}"
+FLARE="${DSV41F_FLARE:-$RUNTIME_ROOT/src-bce032c0/flare/target/release/flare}"
+# Rank 0 only: the model.safetensors of the export's cache entry (scripts/export.sh).
+PACKAGE="${DSV41F_PACKAGE:-}"
 PUBLISHER_KEY="${DSV41F_PUBLISHER_KEY:-}"
 PUBLISHER="${DSV41F_PUBLISHER:-local-development}"
 MASTER_ADDR="${DSV41F_MASTER_ADDR:?DSV41F_MASTER_ADDR unset (rank 0 fabric address; scripts/stage.sh sets it)}"
@@ -55,31 +56,29 @@ one() {
   echo "${matches[0]}"
 }
 
-# Rank 0 exported the package; the peers hold the rank files the agent sent them.
-if [ "$NODE_RANK" = 0 ]; then
-  package="$PACKAGE_DIR/$PACKAGE_NAME.safetensors"
-elif [ -n "$PACKAGE_ID" ]; then
-  package="$HOME/.cache/flare/packages/${PACKAGE_ID}-rank${NODE_RANK}/$PACKAGE_NAME.safetensors"
-else
-  package="$(one "$HOME/.cache/flare/packages/*-rank${NODE_RANK}/$PACKAGE_NAME.safetensors" "rank packages (DSV41F_PACKAGE_ID)")"
+# Rank 0 serves the export's cache entry; the peers name no package, rank 0 sends theirs.
+if [ "$NODE_RANK" = 0 ] && [ -z "$PACKAGE" ]; then
+  PACKAGE="$(one "$HOME/.cache/flare/packages/models/*/*/model.safetensors" "exported cache entries (DSV41F_PACKAGE)")"
 fi
+[ "$NODE_RANK" = 0 ] || PACKAGE=""
 if [ -n "$PUBLISHER_KEY" ]; then
   profile="$HOME/.cache/flare/publishers/$PUBLISHER_KEY.json"
 else
   profile="$(one "$HOME/.cache/flare/publishers/*.json" "publisher profiles (DSV41F_PUBLISHER_KEY)")"
   PUBLISHER_KEY="$(basename "$profile" .json)"
 fi
-for f in "$FLARE" "$package" "$profile"; do
+for f in "$FLARE" "$profile" ${PACKAGE:+"$PACKAGE"}; do
   [ -f "$f" ] || { echo "missing $f (README, quick start)" >&2; exit 1; }
 done
 
-args=(run "$package" --rank "$NODE_RANK" --roce-ring --gpus 0
+# Rank 0 also sends the peers the ring routing.
+args=(run ${PACKAGE:+"$PACKAGE"} --rank "$NODE_RANK" --gpus 0
       --embedding-table-cache-size "$ENGRAM_CACHE"
       --publisher-keys "$profile"
       --dangerously-approve-key "$PUBLISHER_KEY"
       --dangerously-accept-publisher "$PUBLISHER")
 if [ "$NODE_RANK" = 0 ]; then
-  args+=(--rendezvous "0.0.0.0:$MASTER_PORT" --host 127.0.0.1 --port "$HTTP_PORT"
+  args+=(--roce-ring --rendezvous "0.0.0.0:$MASTER_PORT" --host 127.0.0.1 --port "$HTTP_PORT"
          --served-model-name "$SERVED_MODEL_NAME")
 else
   args+=(--rendezvous "$MASTER_ADDR:$MASTER_PORT")
@@ -87,7 +86,7 @@ fi
 # shellcheck disable=SC2206
 [ -n "$EXTRA_FLAGS" ] && args+=($EXTRA_FLAGS)
 
-echo "DeepSeek-V4.1-Flash-1017 on Flare tp=4 rank=$NODE_RANK package=$package" \
+echo "DeepSeek-V4.1-Flash-1017 on Flare tp=4 rank=$NODE_RANK package=${PACKAGE:-from rank 0}" \
      "rendezvous=$MASTER_ADDR:$MASTER_PORT engram_cache=$ENGRAM_CACHE extra=[${EXTRA_FLAGS}]"
 
 "$FLARE" "${args[@]}" < /dev/null &

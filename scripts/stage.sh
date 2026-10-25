@@ -3,8 +3,8 @@
 #   runtime  /opt/spark-llm/profiles/deepseek-v41-1017-flare/bin
 #   env      /etc/spark-llm/profiles/deepseek-v41-1017-flare.env (+ DSV41F_MASTER_ADDR)
 #   unit     /etc/systemd/system/spark-llm-dsv41-flare@.service (+ SPARK_USER, SPARK_RING_PEERS)
-# Build (scripts/build-flare.sh), fetch, export and distribute are separate steps:
-# they compile or move hundreds of GB.
+# Build (scripts/build-flare.sh), fetch and export are separate steps: they compile or
+# move hundreds of GB. The first start after an export sends the peers their ranges.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck disable=SC1091
@@ -30,10 +30,12 @@ for i in "${!hosts[@]}"; do
     ssh -n "$h" "python3 -c 'import cv2' 2>/dev/null || sudo apt-get install -y -q python3-opencv >/dev/null"
   fi
   scp -q "$tmp/deepseek-v41-1017-flare.env" "$tmp/$U" "$h:/tmp/"
+  # Rank 0 serves the export's cache entry; peers receive their ranges from it at start.
   if [ "$i" = 0 ]; then
-    package="$DSV41F_PACKAGE_DIR/$DSV41F_PACKAGE_NAME.safetensors"
+    entry="${DSV41F_PACKAGE:-\$HOME/.cache/flare/packages/models/*/*/model.safetensors}"
+    check_package="ls $entry >/dev/null 2>&1 && echo '  package present' || echo '  package MISSING (scripts/export.sh)'"
   else
-    package="\$HOME/.cache/flare/packages/*-rank$i/$DSV41F_PACKAGE_NAME.safetensors"
+    check_package="echo '  package from rank 0 at start'"
   fi
   ssh -n "$h" "set -e
     sudo install -m 644 /tmp/deepseek-v41-1017-flare.env /etc/spark-llm/profiles/deepseek-v41-1017-flare.env
@@ -41,7 +43,7 @@ for i in "${!hosts[@]}"; do
     sudo systemctl daemon-reload
     ! grep -q '^\[Install\]' '/etc/systemd/system/$U'
     [ -x $FLARE_SRC/flare/target/release/flare ] && echo '  flare present' || echo '  flare MISSING (scripts/build-flare.sh)'
-    ls $package >/dev/null 2>&1 && echo '  package present' || echo '  package MISSING (scripts/export.sh, scripts/distribute.sh)'
-    ls \$HOME/.cache/flare/publishers/*.json >/dev/null 2>&1 && echo '  publisher profile present' || echo '  publisher profile MISSING (scripts/distribute.sh)'
+    $check_package
+    ls \$HOME/.cache/flare/publishers/*.json >/dev/null 2>&1 && echo '  publisher profile present' || echo '  publisher profile MISSING (scripts/publisher.sh)'
     echo staged"
 done

@@ -38,7 +38,7 @@ git log --oneline -4
 
 uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
-# The extension embeds Helios; rebuild it so it carries patches 0002 and 0003.
+# The extension embeds Helios; rebuild it so it carries the patched Helios.
 uv pip install --python .venv/bin/python --no-deps --reinstall ./heliopause
 
 mkdir -p ~/.config/flare
