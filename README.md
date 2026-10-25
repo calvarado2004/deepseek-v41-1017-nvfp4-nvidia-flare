@@ -18,19 +18,19 @@ The same model on the same four Sparks under vLLM is
 (LibertAIDAI's NVFP4 transcode of these weights).
 Flare is faster for one request; vLLM is faster for four.
 
-| Measured, one stream unless noted (tok/s) | Flare `bce032c`, official weights (2026-10-25, evening) | Flare `5f37bd1`, official weights (2026-10-25, morning) | Flare `5f37bd1`, LibertAIDAI NVFP4 (2026-10-22) | vLLM recipe |
-|---|---:|---:|---:|---:|
-| Count to 100 (median of 3; runs) | **129.2** (120.3 / 129.2 / 129.7) | 81.9 | 98.1 | 81 |
-| Code (median of 3; runs) | **109.3** (91.1 / 110.2 / 109.3) | 85.1 | 89.3 | 75 |
-| Prose, English (median of 3; runs) | **57.5** (57.2 / 59.6 / 57.5) | 46.2 | 41.6 | 32 |
-| Prose, Spanish (median of 3; runs) | **54.4** (54.4 / 54.0 / 55.5) | 47.7 | 43.9 | – |
-| Two prose streams, aggregate | **87.0** (43.6 + 45.2) | 84.7 | 66.8 | – |
-| `code_bench`, 1 stream | not measured again | 78.5 | 73.8 | 61.2 |
-| `code_bench`, 4 streams, aggregate | not measured again | 92.3 | 84.4 | 126.4 |
-| Cold prefill, 20K tokens (tok/s) | **3,737** | 3,733 / 1,416 | 3,344 | ~3,500 |
+| Measured, one stream unless noted (tok/s) | Flare `bce032c`, official weights (2026-10-25, evening) | Flare `5f37bd1`, LibertAIDAI NVFP4 (2026-10-22) | vLLM recipe |
+|---|---:|---:|---:|
+| Count to 100 (median of 3; runs) | **129.2** (120.3 / 129.2 / 129.7) | 98.1 | 81 |
+| Code (median of 3; runs) | **109.3** (91.1 / 110.2 / 109.3) | 89.3 | 75 |
+| Prose, English (median of 3; runs) | **57.5** (57.2 / 59.6 / 57.5) | 41.6 | 32 |
+| Prose, Spanish (median of 3; runs) | **54.4** (54.4 / 54.0 / 55.5) | 43.9 | – |
+| Two prose streams, aggregate | **87.0** (43.6 + 45.2) | 66.8 | – |
+| `code_bench`, 1 stream | not measured again | 73.8 | 61.2 |
+| `code_bench`, 4 streams, aggregate | not measured again | 84.4 | 126.4 |
+| Cold prefill, 20K tokens (tok/s) | **3,737** | 3,344 | ~3,500 |
 
 `bench.py` rows: 350-word answers at temperature 0, low effort, 3 runs, on an idle
-card. Same settings in every Flare column: adaptive DSpark verification, the
+card. Same settings in both Flare columns: adaptive DSpark verification, the
 Engram row cache at 6G, and the rendezvous on the fabric (see "Three settings
 that decide the speed"). The `bce032c` column is the current recipe: upstream
 Flare of 2026-10-24 and a new export of the same weights.
