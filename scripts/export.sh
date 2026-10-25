@@ -15,7 +15,9 @@ head="$SPARK_HEAD"
 CONCURRENCY="${CONCURRENCY:-4}"
 DRAFTS="${DRAFTS:-5}"
 PORT="${RENDEZVOUS_PORT:-29630}"
-NAME="${PACKAGE_NAME:-dsv41-1017-nvfp4-tp4ring-c${CONCURRENCY}-dspark${DRAFTS}}"
+NAME="${PACKAGE_NAME:-dsv41-1017-official-tp4ring-c${CONCURRENCY}-dspark${DRAFTS}-csf}"
+# csf compresses the MXFP4 expert scales, as upstream exports DeepSeek V4.1 at TP4.
+EXPORT_FLAGS="${EXPORT_FLAGS:---expert-scale-compression csf}"
 ADDR="$SPARK_HEAD_FABRIC"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 bin="PATH=$FLARE_SRC/flare/target/release:\$PATH"
@@ -25,7 +27,7 @@ ssh -n "$head" "set -e; sudo mkdir -p $DSV41F_PACKAGE_DIR; sudo chown $SPARK_USE
   test ! -e $DSV41F_PACKAGE_DIR/$NAME.safetensors"
 ssh -n "$head" "cd $FLARE_SRC && ($bin setsid nohup .venv/bin/ignition export \
   $DSV41F_MODEL_DIR --gpus 0 --ranks 4 --rendezvous $ADDR:$PORT --roce-ring --cluster ring \
-  --transfer-streams 8 --max-concurrency $CONCURRENCY --mtp-draft-tokens $DRAFTS --prefill-chunk-size 4096 \
+  --transfer-streams 8 --max-concurrency $CONCURRENCY --mtp-draft-tokens $DRAFTS --prefill-chunk-size 4096 $EXPORT_FLAGS \
   --output $DSV41F_PACKAGE_DIR/$NAME.safetensors --verbose \
   > ~/logs/export-$stamp.log 2>&1 < /dev/null &); echo export started"
 sleep 10

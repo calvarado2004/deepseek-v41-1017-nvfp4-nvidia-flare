@@ -2,33 +2,38 @@
   <img src="assets/deepseek-logo.svg" alt="DeepSeek" width="360">
 </p>
 
-# DeepSeek-V4.1-Flash-1017 NVFP4 on NVIDIA Flare, four DGX Sparks
+# DeepSeek-V4.1-Flash-1017 on NVIDIA Flare, four DGX Sparks
 
-A recipe that serves
-[`LibertAIDAI/DeepSeek-V4.1-Flash-1017-NVFP4`](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-NVFP4)
-with [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) at tensor
+A recipe that serves DeepSeek's official weights,
+[`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
+(MXFP4 routed experts, FP8 Engram tables, loaded as published), with [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) at tensor
 parallelism 4 on four NVIDIA DGX Sparks (GB10) cabled as a **switchless QSFP
 ring**. Ignition prepares a signed runtime package once; the Helios runtime then
 runs one rank per Spark, with RoCEnante collectives on the ring cables. 1M-token
 context, thinking on by default, tool calls, images, and video (as frames). The
 API is OpenAI-compatible.
 
-The same checkpoint on the same four Sparks under vLLM is
-[calvarado2004/deepseek-v41-1017-nvfp4](https://github.com/calvarado2004/deepseek-v41-1017-nvfp4).
+The same model on the same four Sparks under vLLM is
+[calvarado2004/deepseek-v41-1017-nvfp4](https://github.com/calvarado2004/deepseek-v41-1017-nvfp4)
+(LibertAIDAI's NVFP4 transcode of these weights).
 Flare is faster for one request; vLLM is faster for four.
 
-| Measured, one stream unless noted (tok/s) | Flare | vLLM recipe |
-|---|---:|---:|
-| Count to 100 | **92–98** | 81 |
-| Code | **85–89** | 75 |
-| Prose (English / Spanish) | **42–45 / 44–48** | 32 / – |
-| Two prose streams, aggregate | 65–67 | – |
-| `code_bench`, 1 stream | **73.8** | 61.2 |
-| `code_bench`, 4 streams, aggregate | 84.4 | **126.4** |
-| Cold prefill, 20K tokens | 3,330–3,344 | ~3,500 |
+| Measured, one stream unless noted (tok/s) | Flare, official weights (2026-10-25) | Flare, LibertAIDAI NVFP4 (2026-10-22) | vLLM recipe |
+|---|---:|---:|---:|
+| Count to 100 (median of 3; runs) | 81.9 (73.2 / 81.9 / 115.8) | 98.1 | 81 |
+| Code (median of 3; runs) | 85.1 (90.0 / 85.1 / 70.8) | 89.3 | 75 |
+| Prose, English (median of 3; runs) | 46.2 (46.5 / 45.0 / 46.2) | 41.6 | 32 |
+| Prose, Spanish (median of 3; runs) | 47.7 (47.7 / 44.6 / 48.7) | 43.9 | – |
+| Two prose streams, aggregate | 84.7 (42.3 + 42.4) | 66.8 | – |
+| `code_bench`, 1 stream | 78.5 | 73.8 | 61.2 |
+| `code_bench`, 4 streams, aggregate | 92.3 (23.1 per stream) | 84.4 | 126.4 |
+| Cold prefill, 20K tokens (tok/s) | 3,733 / 1,416 (two runs) | 3,344 | ~3,500 |
 
-Measured 2026-10-22 with adaptive DSpark verification, the Engram row cache at
-6G, and the rendezvous on the fabric (see "Three settings that decide the speed").
+`bench.py` rows: 350-word answers at temperature 0, low effort, 3 runs. Same
+settings in both Flare columns: adaptive DSpark verification, the Engram row
+cache at 6G, and the rendezvous on the fabric (see "Three settings that decide
+the speed"). The two cold-prefill runs on the official package disagree; a
+third measurement is open.
 
 ## Real work: one prompt, one shot
 
@@ -60,27 +65,24 @@ average over a long Max-effort request is lower than the code-phase peak.
 
 ## Quality
 
-| Check | Result |
+| Check (official weights, 2026-10-25) | Result |
 |---|---|
 | Count to 100, 3 runs | exact 3/3 |
-| Deduction puzzle (6,006 tokens of reasoning) | correct, no loops |
+| Deduction puzzle | correct ("dog"), 4,548 tokens, no loops, no foreign script |
 | Tool calls, listed and deferred, stream and non-stream | pass |
-| Needle in a haystack at 80K, 258K, 517K, 943K tokens | found at every length (943K: 483 s) |
-| 80 concurrent short requests | 80/80 correct |
-| Video, a moving object (TLS front frames) | direction and visibility right |
-| Qwen Code, a small car-dealership Python project | 18 tool calls, 6 modules, **36/36 tests pass**; Qwen Code's side queries pass with patch 0004 |
-| Long agent session, 401 messages (patch 0006) | first token in 0.3 s with the prefix cache; cold 69.7 s for 41.7K tokens |
-| `tests/smoke.py` (6 checks) | 6/6 in 12 s |
-
-Images work (`image_url` parts); the 44-image set that the vLLM recipe scores is
-not scored on Flare yet.
+| Needle in a haystack at 81,920 / 262,144 / 524,288 / 955,000 tokens | found at every length |
+| Images, the vLLM recipe's 44-image set (count, OCR, color, chart, spatial, multi-image) | **44/44** |
+| Video, a moving object (TLS front frames) | pass |
+| Finished reply while another request decodes (`scripts/check_response_completion.py`, patch 0005) | pass: the short reply closed 2 ms after its last token while an 8,192-token reply kept decoding |
+| `tests/smoke.py` (6 checks) | 6/6 |
+| Qwen Code, a small car-dealership Python project (LibertAIDAI weights, 2026-10-22) | 18 tool calls, 6 modules, **36/36 tests pass** |
+| Long agent session, 401 messages (patch 0006, LibertAIDAI weights) | first token in 0.3 s with the prefix cache; cold 69.7 s for 41.7K tokens |
 
 ## Hardware
 
-- 4 × DGX Spark (GB10, 128 GB unified memory). Rank 0 needs about 1.1 TB free
-  disk: the checkpoint (400 GB), its Flare view (190 GB of widened Engram
-  tables) and the package (504 GB). Ranks 1–3 need ~126 GiB each for their rank
-  of the package.
+- 4 × DGX Spark (GB10, 128 GB unified memory). Rank 0 needs about 1 TB free
+  disk: the checkpoint (475 GiB) and the package (474 GiB). Ranks 1–3 need
+  ~119 GiB each for their rank of the package.
 - Four QSFP cables in a ring: rank 0 → 1 → 2 → 3 → 0, each cable on its own
   /24. The vLLM recipe's README describes the cabling and addresses we use.
 - Ubuntu with CUDA 13.3 (`scripts/build-flare.sh` installs `cuda-toolkit-13-3`
@@ -91,10 +93,10 @@ not scored on Flare yet.
 
 | Layer | Choice |
 |---|---|
-| Engine | Flare `5f37bd1` + 6 patches (`patches/`), built from source on each node |
-| Package | `ignition export` at TP=4 with `--roce-ring`, max concurrency 4, 5 DSpark drafts, prefill chunk 4,096 |
-| Experts | NVFP4 W4A4 (patch 0001 teaches Flare's DeepSeek-V4.1 recipe the ModelOpt NVFP4 layout) |
-| Engram tables | widened from packed E2M1 to E4M3 rows, exactly (`scripts/make-flare-checkpoint.py`); rows from NVMe through a 6G row cache |
+| Engine | Flare `5f37bd1` + 5 patches (`patches/`), built from source on each node |
+| Package | `ignition export` at TP=4 with `--roce-ring`, max concurrency 4, 5 DSpark drafts, prefill chunk 4,096, csf expert-scale compression |
+| Experts | MXFP4, as DeepSeek publishes them (Flare's stock deepseek41 recipe) |
+| Engram tables | FP8 E4M3 rows, as published; read from NVMe through a 6G row cache |
 | Speculative decoding | DSpark, 5 drafts, adaptive verification (package default) |
 | Processes | one systemd unit per rank in Flare's documented manual mode (`docs/multi-host.md`, "Start ranks manually"); each rank logs to its own journal |
 | HTTPS | `bin/tls-front.py`: TLS 1.2+ on :8888 in front of Flare's plain HTTP on 127.0.0.1:8001 |
@@ -104,7 +106,6 @@ not scored on Flare yet.
 
 | Patch | Why |
 |---|---|
-| 0001 | Load ModelOpt NVFP4 routed experts (W4A4) when `quantized_layers` declares them. Without it the deepseek41 recipe expects its own layout. |
 | 0002 | Raise the dynamic shared memory limits before graph nodes are rebuilt (dbotwinick's fix on [#2](https://github.com/NVIDIA/flare-local-inference/issues/2)). Without it the load fails at "Prepare execution". |
 | 0003 | Give Helios the RoCE proxy ABI 10 that the locked FlashInfer exports ([#7](https://github.com/NVIDIA/flare-local-inference/issues/7), closed upstream after our pin). |
 | 0004 | A request with `tool_choice: "required"` that asks for no thinking mode is encoded in chat mode. Flare thinks by default, so these requests got HTTP 400 "thinking mode does not support required tool choice"; Qwen Code sends them for its side queries. A request that asks for thinking and forces a tool still gets the 400. |
@@ -135,7 +136,7 @@ not scored on Flare yet.
 2. **Build Flare on every node** (run it on the node):
    `scripts/build-flare.sh`. It clones Flare at the pinned commit and applies
    `patches/`.
-3. **Fetch the checkpoint** to rank 0 and make the Flare view: `scripts/fetch.sh`
+3. **Fetch the checkpoint** to rank 0: `scripts/fetch.sh`
    (detached; `ssh <head> tail -f logs/fetch-dsv41f.log`). Stop every model on
    the head first: on GB10 page cache is GPU memory.
 4. **Pair the agents**: `scripts/agents.sh`.
@@ -143,7 +144,7 @@ not scored on Flare yet.
    then watch `~/logs/export-*.log` on the head.
 6. **Distribute it once**: `scripts/distribute.sh`. Flare shows your development
    key's disclosure on first use; type `local-development` to accept it. The
-   peers then fetch their ranks (~126 GiB each), and the script stops the group
+   peers then fetch their ranks (~119 GiB each), and the script stops the group
    when `/health` answers.
 7. **Stage**: `scripts/stage.sh` (runtime, env, unit). Put a TLS certificate at
    `/etc/ssl/flare/{fullchain,privkey}.pem` on the head, readable by
@@ -154,7 +155,7 @@ not scored on Flare yet.
    minutes later. Logs: `journalctl -u spark-llm-dsv41-flare@N`.
 9. **Test** on the head: `python3 -I tests/smoke.py`.
 
-The API is on `https://<head>:8888/v1`, model `DeepSeek-V4.1-Flash-1017-NVFP4-Flare`.
+The API is on `https://<head>:8888/v1`, model `DeepSeek-V4.1-Flash-1017-Flare`.
 `stage.sh` overwrites the env on the nodes: change `deepseek-v41-1017-flare.env`
 here, not on the nodes. Re-export (step 5) and re-distribute (step 6) after a
 Flare update that changes the package format.
@@ -174,16 +175,17 @@ Flare update that changes the package format.
 
 ## Known gaps
 
-- **Four streams** are 33% slower than vLLM: the package captured few
-  verification widths above batch 1, so concurrent requests rarely draft. An
-  export with wider batch-2/4 captures is the open item.
+- **Four streams** give 92.3 tok/s in aggregate on Flare and 126.4 on vLLM: the
+  package captured few verification widths above batch 1, so concurrent
+  requests rarely draft. An export with wider batch-2/4 captures is the open item.
 - **Prefix reuse** happens at message boundaries only, so long multi-turn
   agent sessions re-prefill more than on vLLM.
-- **Weights**: the LibertAIDAI checkpoint stores the Engram tables in FP4, and
-  its experts are an NVFP4 transcode of DeepSeek's MXFP4 experts. On Flare
-  neither saves GPU memory (Engram rows stay on NVMe). The official
-  `deepseek-ai/DeepSeek-V4.1-Flash-1017` checkpoint loads without patch 0001
-  or `make-flare-checkpoint.py` and keeps the FP8 Engram tables. A move to it is planned.
+- **Literal image placeholders**: Flare rejects request text that contains
+  `<｜image｜>` or `<｜deepseek_image｜>` (HTTP 400, "literal DeepSeek image
+  placeholder is ambiguous"), as DeepSeek's own recipe does. An agent that reads
+  a DeepSeek tokenizer, template or recipe file keeps that text in its history,
+  so every later turn of that session fails; a new session works. A patch that
+  encodes the literal text as plain text is in test, on a newer Flare pin.
 - Flare's docs call physical ring cabling and full-model ring serving
   "unqualified". This recipe is a community result on that path, not an NVIDIA
   configuration.
@@ -194,10 +196,9 @@ Flare update that changes the package format.
 bin/launch-rank                 one rank: flare run with the recipe's settings; rank 0 adds HTTP and the TLS front
 bin/tls-front.py                TLS on :8888, video parts become frames
 bin/dsv41_video_frames.py       the frame sampler (from the vLLM recipe)
-patches/                        0001-0006 for Flare 5f37bd1 (see NOTICE)
+patches/                        0002-0006 for Flare 5f37bd1 (see NOTICE)
 scripts/build-flare.sh          build patched Flare on one node
-scripts/fetch.sh                checkpoint to rank 0, then make-flare-checkpoint.py
-scripts/make-flare-checkpoint.py   exact E2M1 -> E4M3 widening of the Engram tables into a view directory
+scripts/fetch.sh                the official checkpoint to rank 0
 scripts/agents.sh               Flare agents, paired on the fabric
 scripts/export.sh               four-rank ignition export / join
 scripts/distribute.sh           one orbit run: each peer gets its rank and the publisher profile
@@ -217,8 +218,8 @@ pins.env                        checkpoint revision, Flare commit, paths
 - **dbotwinick** — the shared-memory fix on Flare issue #2 (patch 0002), and
   issue #7 (patch 0003).
 - **Martin Vit** — Flare PR #75, the terminal-snapshot fix (patch 0005).
-- **LibertAIDAI** — the NVFP4 checkpoint.
-- **DeepSeek** — the model and DSpark.
+- **DeepSeek** — the model, its weights and DSpark.
+- **LibertAIDAI** — the NVFP4 checkpoint that earlier versions of this recipe served.
 - **FlashInfer** contributors — the RoCE proxy sources in patch 0003.
 
 ## License

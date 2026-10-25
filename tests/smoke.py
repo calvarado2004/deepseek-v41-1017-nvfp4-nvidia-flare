@@ -2,7 +2,7 @@
 """Smoke test for the served card: one short request per feature, one at a time.
 
     python3 -I tests/smoke.py [URL] [MODEL]
-    (defaults: https://127.0.0.1:8888, DeepSeek-V4.1-Flash-1017-NVFP4-Flare)
+    (defaults: https://127.0.0.1:8888, DeepSeek-V4.1-Flash-1017-Flare)
 
   models     the model is listed
   count      thinking off (chat_template_kwargs.enable_thinking=false): 1..30 exact
@@ -17,7 +17,7 @@ Standard library only, plus OpenCV for the video check. Exit code 1 if a check f
 import base64, json, os, ssl, sys, tempfile, urllib.request
 
 URL = (sys.argv[1] if len(sys.argv) > 1 else "https://127.0.0.1:8888").rstrip("/")
-MODEL = sys.argv[2] if len(sys.argv) > 2 else "DeepSeek-V4.1-Flash-1017-NVFP4-Flare"
+MODEL = sys.argv[2] if len(sys.argv) > 2 else "DeepSeek-V4.1-Flash-1017-Flare"
 TLS = ssl._create_unverified_context()  # the certificate names the public host, not 127.0.0.1
 OFF = {"chat_template_kwargs": {"enable_thinking": False}}
 WEATHER = {"type": "function", "function": {

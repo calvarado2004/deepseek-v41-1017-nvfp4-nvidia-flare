@@ -7,7 +7,7 @@
 # from /metrics) is the time outside the GPU graphs.
 import json, os, re, sys, time, urllib.request
 URL = "http://127.0.0.1:8001"
-MODEL = os.environ.get("AB_MODEL", "DeepSeek-V4.1-Flash-1017-NVFP4-Flare")
+MODEL = os.environ.get("AB_MODEL", "DeepSeek-V4.1-Flash-1017-Flare")
 P = {"count": "Count from 1 to 100, separated by commas. Output only the numbers.",
      "code": "Write a Python LRU cache class with get and put in O(1), with type hints. Code only.",
      "prose": "Write a 350-word essay on the history of the printing press."}

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Run one rank of DeepSeek-V4.1-Flash-1017 NVFP4 (LibertAIDAI) on NVIDIA Flare at TP=4
+# Run one rank of DeepSeek-V4.1-Flash-1017 (official deepseek-ai weights) on NVIDIA Flare at TP=4
 # across four Sparks cabled in a loop with no switch:
 #
 #   rank 0 -> rank 1 -> rank 2 -> rank 3 -> rank 0 (one QSFP cable each)
@@ -29,7 +29,7 @@ NODE_RANK="$1"
 
 RUNTIME_ROOT="${DSV41F_RUNTIME_ROOT:-/opt/spark-llm/profiles/deepseek-v41-1017-flare}"
 FLARE="${DSV41F_FLARE:-$RUNTIME_ROOT/src/flare/target/release/flare}"
-PACKAGE_NAME="${DSV41F_PACKAGE_NAME:-dsv41-1017-nvfp4-tp4ring-c4-dspark5}"
+PACKAGE_NAME="${DSV41F_PACKAGE_NAME:-dsv41-1017-official-tp4ring-c4-dspark5-csf}"
 PACKAGE_DIR="${DSV41F_PACKAGE_DIR:-/srv/spark-llm/flare-runtime}"
 PACKAGE_ID="${DSV41F_PACKAGE_ID:-}"
 PUBLISHER_KEY="${DSV41F_PUBLISHER_KEY:-}"
@@ -38,7 +38,7 @@ MASTER_ADDR="${DSV41F_MASTER_ADDR:?DSV41F_MASTER_ADDR unset (rank 0 fabric addre
 MASTER_PORT="${DSV41F_MASTER_PORT:-29800}"
 HTTP_PORT="${DSV41F_HTTP_PORT:-8001}"
 PORT="${DSV41F_PORT:-8888}"
-SERVED_MODEL_NAME="${DSV41F_SERVED_MODEL_NAME:-DeepSeek-V4.1-Flash-1017-NVFP4-Flare}"
+SERVED_MODEL_NAME="${DSV41F_SERVED_MODEL_NAME:-DeepSeek-V4.1-Flash-1017-Flare}"
 # Engram row cache per host; 0 sends every row to NVMe (4.6 ms a gather).
 ENGRAM_CACHE="${DSV41F_ENGRAM_CACHE:-6G}"
 # Extra `flare run` flags. Empty = package defaults (adaptive verification: faster on
@@ -87,7 +87,7 @@ fi
 # shellcheck disable=SC2206
 [ -n "$EXTRA_FLAGS" ] && args+=($EXTRA_FLAGS)
 
-echo "DeepSeek-V4.1-Flash-1017 NVFP4 on Flare tp=4 rank=$NODE_RANK package=$package" \
+echo "DeepSeek-V4.1-Flash-1017 on Flare tp=4 rank=$NODE_RANK package=$package" \
      "rendezvous=$MASTER_ADDR:$MASTER_PORT engram_cache=$ENGRAM_CACHE extra=[${EXTRA_FLAGS}]"
 
 "$FLARE" "${args[@]}" < /dev/null &
