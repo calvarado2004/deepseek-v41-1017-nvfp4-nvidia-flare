@@ -16,7 +16,7 @@ API is OpenAI-compatible.
 The same model on the same four Sparks under vLLM is
 [calvarado2004/deepseek-v41-1017-nvfp4](https://github.com/calvarado2004/deepseek-v41-1017-nvfp4)
 (LibertAIDAI's NVFP4 transcode of these weights).
-Flare is faster for one request; vLLM is faster for four.
+Flare is faster for one request and for four.
 
 | Measured, one stream unless noted (tok/s) | Flare `bce032c`, official weights (2026-10-25, evening) | Flare `5f37bd1`, LibertAIDAI NVFP4 (2026-10-22) | vLLM recipe |
 |---|---:|---:|---:|
@@ -25,12 +25,13 @@ Flare is faster for one request; vLLM is faster for four.
 | Prose, English (median of 3; runs) | **57.5** (57.2 / 59.6 / 57.5) | 41.6 | 32 |
 | Prose, Spanish (median of 3; runs) | **54.4** (54.4 / 54.0 / 55.5) | 43.9 | – |
 | Two prose streams, aggregate | **87.0** (43.6 + 45.2) | 66.8 | – |
-| `code_bench`, 1 stream | not measured again | 73.8 | 61.2 |
-| `code_bench`, 4 streams, aggregate | not measured again | 84.4 | 126.4 |
+| `code_bench`, 1 stream (median of 3; runs) | **91.9** (95.2 / 91.9 / 89.5) | 73.8 | 61.2 |
+| `code_bench`, 4 streams, aggregate (median of 3; runs) | **160.2** (160.2 / 159.4 / 172.0; 40.0 per stream) | 84.4 | 126.4 |
 | Cold prefill, 20K tokens (tok/s) | **3,737** | 3,344 | ~3,500 |
 
 `bench.py` rows: 350-word answers at temperature 0, low effort, 3 runs, on an idle
-card. Same settings in both Flare columns: adaptive DSpark verification, the
+card. `code_bench` rows: eight coding tasks, 512 tokens each (`ignore_eos`),
+thinking off, temperature 0. Same settings in both Flare columns: adaptive DSpark verification, the
 Engram row cache at 6G, and the rendezvous on the fabric (see "Three settings
 that decide the speed"). The `bce032c` column is the current recipe: upstream
 Flare of 2026-10-24 and a new export of the same weights.
@@ -196,9 +197,6 @@ required; re-export the checkpoint".
 
 ## Known gaps
 
-- **Four streams** give 92.3 tok/s in aggregate on Flare and 126.4 on vLLM: the
-  package captured few verification widths above batch 1, so concurrent
-  requests rarely draft. An export with wider batch-2/4 captures is the open item.
 - **Prefix reuse** happens at message boundaries only. With patch 0008 a long
   agent session keeps its prefix while short requests churn the 256 slots
   (tested at 300K tokens); the 900K-token run of `qualify/prefix_retention.py`
