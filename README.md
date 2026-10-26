@@ -90,7 +90,7 @@ average over a long Max-effort request is lower than the code-phase peak.
 | Needle in a haystack at 81,920 / 262,144 / 524,288 / 955,000 tokens | found at every length |
 | Images, the vLLM recipe's 44-image set (count, OCR, color, chart, spatial, multi-image) | **44/44** |
 | Video, a moving object (TLS front frames) | pass |
-| Finished reply while another request decodes (`scripts/check_response_completion.py`; then patch 0005, upstream since `a7d51ca1`) | pass on `5f37bd1`: the short reply closed 2 ms after its last token while an 8,192-token reply kept decoding |
+| Finished reply while another request decodes (the check that came with the earlier patch 0005, upstream since `a7d51ca1`) | pass on `5f37bd1`: the short reply closed 2 ms after its last token while an 8,192-token reply kept decoding |
 | Qwen Code, a small car-dealership Python project (LibertAIDAI weights, 2026-10-22) | 18 tool calls, 6 modules, **36/36 tests pass** |
 | Long agent session, 401 messages (then patch 0006, upstream since `67ba265e`; LibertAIDAI weights) | first token in 0.3 s with the prefix cache; cold 69.7 s for 41.7K tokens |
 
@@ -98,8 +98,8 @@ average over a long Max-effort request is lower than the code-phase peak.
 
 - 4 × DGX Spark (GB10, 128 GB unified memory). Rank 0 needs about 1 TB free
   disk: the checkpoint (475 GiB) and the package (474 GiB). Ranks 1–3 need
-  about 261 GiB each: the first start writes their rank of the package and the
-  shared data into their own model cache.
+  about 261 GiB (280 GB) each: the first start writes their rank of the package
+  and the shared data into their own model cache.
 - Four QSFP cables in a ring: rank 0 → 1 → 2 → 3 → 0, each cable on its own
   /24. The vLLM recipe's README describes the cabling and addresses we use.
 - Ubuntu with CUDA 13.3 (`scripts/build-flare.sh` installs `cuda-toolkit-13-3`
@@ -118,6 +118,8 @@ average over a long Max-effort request is lower than the code-phase peak.
 | Processes | one systemd unit per rank in Flare's documented manual mode (`docs/multi-host.md`, "Start ranks manually"): rank 0 serves the export's cache entry and sends each peer its ranges at the first start; each rank logs to its own journal |
 | Prefix cache | 256 GPU snapshot slots (`--prefix-cache-snapshots`, patch 0008) instead of 32, evicted by recompute cost |
 | HTTPS | `bin/tls-front.py`: TLS 1.2+ on :8888 in front of Flare's plain HTTP on 127.0.0.1:8001 |
+| Warm start | 71 s from start to serving (patch 0009); the first start after an export about 10 minutes |
+| Logs | one `req`/`end` line per request in rank 0's journal, and a flight recorder on every rank (see [Logs](#logs)) |
 | Video | the TLS front turns `video_url` parts into timestamped JPEG frames (`bin/dsv41_video_frames.py`, the vLLM recipe's module) |
 
 ### The patches
@@ -127,8 +129,7 @@ average over a long Max-effort request is lower than the code-phase peak.
 | 0004 | A request with `tool_choice: "required"` that asks for no thinking mode is encoded in chat mode. Flare thinks by default, so these requests got HTTP 400 "thinking mode does not support required tool choice"; Qwen Code sends them for its side queries. A request that asks for thinking and forces a tool still gets the 400. |
 | 0007 | Literal `<｜image｜>` and `<｜deepseek_image｜>` in request text are plain text, not image placeholders. Flare returned HTTP 400 "literal DeepSeek image placeholder is ambiguous" for the rest of an agent session once a tool result had read a DeepSeek tokenizer, template or recipe file (Qwen Code at 155K tokens). |
 | 0008 | Long conversations stay warm under snapshot-slot pressure ([Flare issue #47](https://github.com/NVIDIA/flare-local-inference/issues/47)). Flare keeps eight snapshot slots per concurrent request (32 here) and evicted the least recently used. A Qwen Code session shares them with its own subagents and side queries, so after a few minutes of subagent work its next turn prefilled the whole 381K-token context again, with 22M KV tokens free. The patch evicts by GreedyDual-Size over the tokens an eviction loses (a long conversation outlasts many short ones, an idle one still ages out) and adds `--prefix-cache-snapshots N`; this recipe sets 256. Unit and scheduler tests fail on the unpatched pin and pass with the patch; `qualify/prefix_retention.py` (in the patch) runs the scenario on a live server. |
-
-| 0009 | Fast warm starts. On every start each peer re-hashes its cached rank (about 280 GB) before it serves; Flare keeps this check on purpose, so a damaged copy is fetched again. The hash read and hashed one payload after another on one thread through 4 MiB page-cache reads: 0.6 GB/s, while one core hashes SHA-256 at 2.5 GB/s and the NVMe reads 9–13 GB/s. The patch hashes on Flare's package verification workers (at most 8), and reads each payload in 16 MiB direct-I/O blocks on a second thread while the previous block is hashed. The two 98 GB Engram planes now set the time. The check is the same (the upstream corrupted-cache test passes; a new unit test compares direct and buffered digests). The distribute step went from 425–514 s to 46.5 s, and start to serving from 7–9.5 min to 71 s. The reads also stay out of the page cache, which is GPU memory on GB10. |
+| 0009 | Fast warm starts. Each start, every peer re-hashes its cached rank (about 280 GB) before it serves; Flare keeps this check so that a damaged copy is fetched again. The hash ran on one thread through 4 MiB page-cache reads, at 0.6 GB/s (one core hashes SHA-256 at 2.5 GB/s, the NVMe reads 9–13 GB/s). The patch hashes on Flare's package verification workers (at most 8), and reads each payload in 16 MiB direct-I/O blocks on a second thread while the previous block is hashed. Same check: the upstream corrupted-cache test passes, and a new unit test compares direct and buffered digests. Start to serving: 7–9.5 min before, **71 s** with the patch. The reads also stay out of the page cache, which is GPU memory on GB10. |
 
 Upstream `bce032c` already carries the fixes of this recipe's earlier patches:
 0002 (shared memory, [#2](https://github.com/NVIDIA/flare-local-inference/issues/2), `37c87e1d`),
@@ -144,9 +145,10 @@ boundaries from one tokenization, `67ba265e`, `03940fa5`).
    Wi-Fi (17–29 ms RTT, 185 ms peaks): 37–61 ms outside the GPU each round, and
    36/33/15 tok/s instead of 98/89/42. `SPARK_HEAD_FABRIC` sets it for the
    systemd ranks and for the export.
-2. **Engram row cache.** Off by default: every row is a direct-I/O NVMe read (7.2 M
-   reads, 4.6 ms a gather). `DSV41F_ENGRAM_CACHE=6G` keeps about 8 GiB
-   MemAvailable per node.
+2. **Engram row cache.** Without it every row is a direct-I/O NVMe read (7.2 M
+   reads, 4.6 ms a gather; the first Flare pin we used had no cache by default).
+   `bce032c` defaults to 1 GiB on unified-memory GPUs. `DSV41F_ENGRAM_CACHE=6G`
+   keeps about 8 GiB MemAvailable per node.
 3. **Keep adaptive verification.** `--no-mtp-adaptive-verification` was slower on
    every bench (code 78.5 vs 89.3, prose 35.6 vs 41.6) and drafts nothing at
    batch > 1.
