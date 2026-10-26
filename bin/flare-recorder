@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Flight recorder for one Flare rank: what the host and the server did before a failure.
+
+Flare logs only its start phases and errors, so a rank that stalls leaves no trace of the
+load or the host state before it. launch-rank runs this next to each rank:
+
+  metrics-YYYYMMDD.jsonl  rank 0 only, every DSV41F_METRICS_INTERVAL s (5): the flare_*
+                          series of /metrics (histogram buckets left out) and how long
+                          /metrics took to answer, or why it did not.
+  host-YYYYMMDD.jsonl     every rank, every DSV41F_HOST_INTERVAL s (60): memory, swap and
+                          pressure (PSI), the rank process (state, RSS, threads, CPU), the
+                          fabric ports (carrier, NIC PHY and RDMA error counters) and the
+                          GPU (clocks, power, temperature, throttle reasons).
+
+Files go to DSV41F_LOG_DIR (/var/log/spark-llm/dsv41-flare, made by stage.sh). Earlier days
+are gzipped, and files older than DSV41F_LOG_DAYS (14) are deleted. Counters are raw
+totals: diff two records for a rate.
+
+  flare-recorder RANK RANK_PID          record until stopped
+  flare-recorder --once RANK RANK_PID   one record of each kind (launch-rank, after the rank exits)
+"""
+import datetime, glob, gzip, json, os, shutil, signal, socket, subprocess, sys, threading, time
+import urllib.request
+
+LOG_DIR = os.environ.get("DSV41F_LOG_DIR", "/var/log/spark-llm/dsv41-flare")
+KEEP_DAYS = int(os.environ.get("DSV41F_LOG_DAYS", "14"))
+METRICS_INTERVAL = float(os.environ.get("DSV41F_METRICS_INTERVAL", "5"))
+HOST_INTERVAL = float(os.environ.get("DSV41F_HOST_INTERVAL", "60"))
+METRICS_URL = f"http://127.0.0.1:{os.environ.get('DSV41F_HTTP_PORT', '8001')}/metrics"
+FABRIC = ("enp1s0f0np0", "enp1s0f1np1", "enP2p1s0f0np0", "enP2p1s0f1np1")
+ETHTOOL = ("rx_crc_errors_phy", "rx_symbol_err_phy", "rx_corrected_bits_phy",
+           "rx_discards_phy", "rx_out_of_buffer", "rx_pause_ctrl_phy", "tx_pause_ctrl_phy",
+           "tx_discards_phy", "rx_buffer_passed_thres_phy")
+RDMA = ("roce_adp_retrans", "roce_adp_retrans_to", "roce_slow_restart_cnps", "local_ack_timeout_err",
+        "packet_seq_err", "out_of_sequence", "out_of_buffer", "rnr_nak_retry_err",
+        "req_cqe_error", "resp_cqe_error", "np_cnp_sent", "rp_cnp_handled", "implied_nak_seq_err")
+GPU = ("temperature.gpu", "power.draw", "clocks.sm", "clocks.mem", "utilization.gpu",
+       "clocks_throttle_reasons.active")
+HOST = socket.gethostname().split(".")[0]
+stop = threading.Event()
+lock = threading.Lock()
+
+
+def write(kind, record):
+    record = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+              "host": HOST, **record}
+    path = os.path.join(LOG_DIR, f"{kind}-{datetime.date.today():%Y%m%d}.jsonl")
+    with lock, open(path, "a") as f:
+        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def number(text):
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def metrics():
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(METRICS_URL, timeout=4) as response:
+            text = response.read().decode()
+    except Exception as e:
+        return {"ms": round((time.monotonic() - start) * 1000), "error": str(e) or type(e).__name__}
+    series = {}
+    for line in text.splitlines():
+        if line.startswith("flare_") and "_bucket{" not in line:
+            name, _, value = line.rpartition(" ")
+            try:
+                series[name] = float(value)
+            except ValueError:
+                pass
+    return {"ms": round((time.monotonic() - start) * 1000), "m": series}
+
+
+def meminfo():
+    keep = {"MemTotal", "MemAvailable", "MemFree", "Cached", "Dirty", "Writeback", "SwapTotal",
+            "SwapFree", "Unevictable", "Mlocked"}
+    out = {}
+    for line in (read("/proc/meminfo") or "").splitlines():
+        name, _, rest = line.partition(":")
+        if name in keep:
+            out[name] = int(rest.split()[0]) // 1024  # MiB
+    return out
+
+
+def vmstat():
+    keep = {"pswpin", "pswpout", "pgmajfault", "oom_kill", "allocstall_normal", "compact_stall"}
+    return {name: int(value) for name, value in
+            (line.split() for line in (read("/proc/vmstat") or "").splitlines()) if name in keep}
+
+
+def pressure():
+    out = {}
+    for kind in ("cpu", "memory", "io"):
+        for line in (read(f"/proc/pressure/{kind}") or "").splitlines():
+            scope, *fields = line.split()
+            values = dict(field.split("=") for field in fields)
+            out[f"{kind}_{scope}"] = [float(values["avg10"]), int(values["total"])]
+    return out
+
+
+def process(pid):
+    status = read(f"/proc/{pid}/status")
+    stat = read(f"/proc/{pid}/stat")
+    if status is None or stat is None:
+        return {"pid": pid, "alive": False}
+    fields = dict(line.split(":", 1) for line in status.splitlines())
+    ticks = os.sysconf("SC_CLK_TCK")
+    after = stat.rpartition(")")[2].split()
+    return {"pid": pid, "alive": True, "state": fields["State"].strip(),
+            "rss_mib": int(fields["VmRSS"].split()[0]) // 1024,
+            "threads": int(fields["Threads"]),
+            "cpu_s": round((int(after[11]) + int(after[12])) / ticks, 1),
+            "ctxsw": [int(fields["voluntary_ctxt_switches"]),
+                      int(fields["nonvoluntary_ctxt_switches"])]}
+
+
+def rdma_devices():
+    out = {}
+    for net in glob.glob("/sys/class/infiniband/*/device/net/*"):
+        out[os.path.basename(net)] = net.split("/device/net/")[0]
+    return out
+
+
+def fabric():
+    devices = rdma_devices()
+    out = {}
+    for netdev in FABRIC:
+        base = f"/sys/class/net/{netdev}"
+        if not os.path.isdir(base):
+            continue
+        port = {"oper": read(f"{base}/operstate"),
+                "carrier_changes": number(read(f"{base}/carrier_changes")),
+                **{key: number(read(f"{base}/statistics/{key}"))
+                   for key in ("rx_bytes", "tx_bytes", "rx_errors", "rx_dropped", "tx_errors")}}
+        try:
+            text = subprocess.run(["ethtool", "-S", netdev], capture_output=True, text=True,
+                                  timeout=5).stdout
+            for line in text.splitlines():
+                name, _, value = line.strip().partition(": ")
+                if name in ETHTOOL:
+                    port[name] = number(value)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            port["ethtool_error"] = str(e)
+        if netdev in devices:
+            counters = os.path.join(devices[netdev], "ports", "1", "hw_counters")
+            for name in RDMA:
+                value = read(os.path.join(counters, name))
+                if value is not None:
+                    port[name] = number(value)
+        out[netdev] = port
+    return out
+
+
+def gpu():
+    start = time.monotonic()
+    try:
+        text = subprocess.run(["nvidia-smi", f"--query-gpu={','.join(GPU)}",
+                               "--format=csv,noheader,nounits"],
+                              capture_output=True, text=True, timeout=15).stdout.strip()
+        values = [value.strip() for value in text.split(",")]
+        out = dict(zip(GPU, values)) if len(values) == len(GPU) else {"raw": text}
+    except (OSError, subprocess.TimeoutExpired) as e:
+        out = {"error": str(e)}
+    # A slow nvidia-smi is itself a sign of a stuck driver.
+    out["ms"] = round((time.monotonic() - start) * 1000)
+    return out
+
+
+def host(rank, pid):
+    record = {"rank": rank, "load": read("/proc/loadavg")}
+    for key, part in (("mem_mib", meminfo), ("vm", vmstat), ("psi", pressure),
+                      ("fabric", fabric), ("gpu", gpu)):
+        try:
+            record[key] = part()
+        except Exception as e:  # one broken source must not stop the others
+            record[key] = {"error": f"{type(e).__name__}: {e}"}
+    record["rank_process"] = process(pid)
+    return record
+
+
+def tidy():
+    today = f"{datetime.date.today():%Y%m%d}"
+    limit = time.time() - KEEP_DAYS * 86400
+    for path in glob.glob(os.path.join(LOG_DIR, "*-*.jsonl*")):
+        try:
+            if os.path.getmtime(path) < limit:
+                os.remove(path)
+            elif path.endswith(".jsonl") and not path.endswith(f"-{today}.jsonl"):
+                with open(path, "rb") as source, gzip.open(path + ".gz", "wb") as target:
+                    shutil.copyfileobj(source, target)
+                os.remove(path)
+        except OSError as e:
+            print(f"flare-recorder: tidy {path}: {e}", file=sys.stderr, flush=True)
+
+
+def every(interval, action):
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            action()
+        except Exception as e:
+            print(f"flare-recorder: {e!r}", file=sys.stderr, flush=True)
+        stop.wait(max(0.0, interval - (time.monotonic() - started)))
+
+
+def main(argv):
+    once = argv[:1] == ["--once"]
+    if once:
+        argv = argv[1:]
+    if len(argv) != 2:
+        sys.exit(__doc__.split("\n\n")[-1])
+    rank, pid = int(argv[0]), int(argv[1])
+    os.makedirs(LOG_DIR, exist_ok=True)
+    if once:
+        if rank == 0:
+            write("metrics", {"final": True, **metrics()})
+        write("host", {"final": True, **host(rank, pid)})
+        return
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    print(f"flare-recorder rank {rank} pid {pid} -> {LOG_DIR} (metrics {METRICS_INTERVAL:g}s "
+          f"on rank 0, host {HOST_INTERVAL:g}s)", flush=True)
+    jobs = [lambda: write("host", host(rank, pid)), lambda: tidy()]
+    intervals = [HOST_INTERVAL, 3600]
+    if rank == 0:
+        jobs.append(lambda: write("metrics", metrics()))
+        intervals.append(METRICS_INTERVAL)
+    threads = [threading.Thread(target=every, args=(interval, job), daemon=True)
+               for interval, job in zip(intervals, jobs)]
+    for thread in threads:
+        thread.start()
+    stop.wait()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

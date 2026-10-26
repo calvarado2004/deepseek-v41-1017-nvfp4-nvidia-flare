@@ -1,0 +1,355 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlos Alvarado Martinez <45523697+calvarado2004@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:50:50 -0400
+Subject: [PATCH] Hash stored payloads in parallel with overlapped direct reads
+
+A peer that reuses its cached rank re-verifies it on every start with
+verify_stored_data(), which read and hashed one payload after another on
+one thread through 4 MiB buffered reads. On GB10 that ran at 0.6-0.7 GB/s
+while SHA-256 runs at 2.5 GB/s per core and the NVMe gives 9-13 GB/s, so a
+280 GB DeepSeek V4.1 TP4 rank took about 7 minutes to start.
+
+- Both payload verify_stored_data() paths hash on the package reader
+  verification workers (at most 8, as for package verification).
+- Each payload is read in aligned 16 MiB blocks through the payload file
+  cached direct-I/O handle on a reader thread, while the previous block is
+  hashed. One payload therefore streams at hashing speed, and the reads
+  stay out of the page cache, which is GPU memory on unified-memory GPUs.
+  A filesystem that refuses direct I/O falls back to buffered reads.
+
+Every payload is still hashed and the first failure in payload order is
+returned, so a corrupted warm entry is still rejected and rebuilt.
+---
+ helios/src/package/reader.rs             |   2 +-
+ helios/src/runtime_package/protection.rs | 264 +++++++++++++++++++----
+ 2 files changed, 226 insertions(+), 40 deletions(-)
+
+diff --git a/helios/src/package/reader.rs b/helios/src/package/reader.rs
+index 7fabcaac..bb0662dc 100644
+--- a/helios/src/package/reader.rs
++++ b/helios/src/package/reader.rs
+@@ -330,7 +330,7 @@ impl PayloadFiles {
+ 
+ const MAX_VERIFY_WORKERS: usize = 8;
+ 
+-fn verification_workers(payloads: usize) -> usize {
++pub(crate) fn verification_workers(payloads: usize) -> usize {
+     std::thread::available_parallelism()
+         .map_or(1, |workers| workers.get())
+         .min(MAX_VERIFY_WORKERS)
+diff --git a/helios/src/runtime_package/protection.rs b/helios/src/runtime_package/protection.rs
+index 155286ee..3d5bacdd 100644
+--- a/helios/src/runtime_package/protection.rs
++++ b/helios/src/runtime_package/protection.rs
+@@ -21,6 +21,165 @@ use std::{
+ 
+ pub(super) const CHUNK: usize = 4 << 20;
+ 
++/// Hash stored payloads on the package reader's verification workers. One reader that reads and
++/// hashes in turn stays far below NVMe bandwidth (0.7 GB/s against 9-13 GB/s on GB10), so a
++/// cached multi-host rank of 280 GB took 7 minutes to re-verify on every start. Every payload is
++/// still hashed; the first failure in payload order is returned.
++/// Bytes of one direct read while a stored payload is hashed.
++const DIRECT_HASH_BLOCK: usize = 16 << 20;
++/// Direct-read buffers per payload: one being hashed, two being read.
++const DIRECT_HASH_BUFFERS: usize = 3;
++
++/// Hash one stored payload against its id. A reader thread fills aligned direct-I/O blocks while
++/// this thread hashes the previous one, so one payload streams at SHA-256 speed (98 GB Engram
++/// planes took 3 minutes through 4 MiB buffered reads on GB10, where the page cache also takes
++/// GPU memory). A filesystem that refuses direct I/O is read through the page cache.
++fn hash_stored(file: &super::archive::PayloadFile, nbytes: u64, id: &[u8]) -> Result<()> {
++    let direct = if nbytes == 0 {
++        None
++    } else {
++        file.direct().ok()
++    };
++    let digest = match direct.map(|direct| hash_direct(&direct, file.start, nbytes)) {
++        Some(Ok(digest)) => digest,
++        Some(Err(error)) if error.raw_os_error() != Some(libc::EINVAL) => {
++            return Err(invalid(format!("read payload: {error}")));
++        }
++        _ => hash_buffered(&file.file, file.start, nbytes)?,
++    };
++    if digest.as_ref() != id {
++        return Err(invalid("payload content verification failed"));
++    }
++    Ok(())
++}
++
++fn hash_buffered(file: &File, start: u64, nbytes: u64) -> Result<digest::Digest> {
++    let mut context = digest::Context::new(&digest::SHA256);
++    let mut buffer = vec![0u8; CHUNK];
++    let mut offset = 0u64;
++    while offset < nbytes {
++        let count = usize::try_from((nbytes - offset).min(CHUNK as u64))
++            .map_err(|_| invalid("payload hash length overflow"))?;
++        FileReadAt::read_exact_at(file, &mut buffer[..count], start + offset)
++            .map_err(|error| invalid(format!("read payload: {error}")))?;
++        context.update(&buffer[..count]);
++        offset += count as u64;
++    }
++    Ok(context.finish())
++}
++
++/// SHA-256 of `nbytes` at `start`, read in aligned blocks of `DIRECT_HASH_BLOCK` through a
++/// direct-I/O handle. The bytes around the payload inside the first and last block are skipped.
++fn hash_direct(file: &File, start: u64, nbytes: u64) -> io::Result<digest::Digest> {
++    use std::sync::mpsc::sync_channel;
++
++    const ALIGN: u64 = 4096;
++    let end = start + nbytes;
++    let first = start - start % ALIGN;
++    let block = DIRECT_HASH_BLOCK as u64;
++    let blocks = (end - first).div_ceil(block);
++    // A Vec moved between threads keeps its heap address, so the aligned window stays valid.
++    let window = |buffer: &[u8]| buffer.as_ptr().align_offset(ALIGN as usize);
++    let (filled_tx, filled_rx) = sync_channel::<io::Result<(Vec<u8>, u64, usize)>>(DIRECT_HASH_BUFFERS);
++    let (empty_tx, empty_rx) = sync_channel::<Vec<u8>>(DIRECT_HASH_BUFFERS);
++    for _ in 0..DIRECT_HASH_BUFFERS {
++        empty_tx
++            .send(vec![0u8; DIRECT_HASH_BLOCK + ALIGN as usize])
++            .expect("empty buffer channel has room for every buffer");
++    }
++    std::thread::scope(|scope| {
++        scope.spawn(move || {
++            for index in 0..blocks {
++                let Ok(mut buffer) = empty_rx.recv() else {
++                    return;
++                };
++                let position = first + index * block;
++                let skip = window(&buffer);
++                let wanted = (end - position).min(block).div_ceil(ALIGN) * ALIGN;
++                let target = &mut buffer[skip..skip + wanted as usize];
++                let mut filled = 0usize;
++                let result = loop {
++                    if filled == target.len() {
++                        break Ok(filled);
++                    }
++                    match FileReadAt::read_at(file, &mut target[filled..], position + filled as u64) {
++                        // End of file inside the last aligned block.
++                        Ok(0) if position + filled as u64 >= end => break Ok(filled),
++                        Ok(0) => break Err(io::ErrorKind::UnexpectedEof.into()),
++                        Ok(count) => filled += count,
++                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
++                        Err(error) => break Err(error),
++                    }
++                };
++                let failed = result.is_err();
++                if filled_tx.send(result.map(|filled| (buffer, position, filled))).is_err() || failed {
++                    return;
++                }
++            }
++        });
++        let mut context = digest::Context::new(&digest::SHA256);
++        for _ in 0..blocks {
++            let (buffer, position, filled) = filled_rx
++                .recv()
++                .map_err(|_| io::Error::other("payload reader stopped"))??;
++            let skip = window(&buffer);
++            let low = start.saturating_sub(position) as usize;
++            let high = ((end - position) as usize).min(filled);
++            if high < low {
++                return Err(io::ErrorKind::UnexpectedEof.into());
++            }
++            context.update(&buffer[skip + low..skip + high]);
++            // The reader may have finished; a closed channel only means no more blocks.
++            let _ = empty_tx.send(buffer);
++        }
++        Ok(context.finish())
++    })
++}
++
++fn hash_payloads(
++    ids: &std::collections::BTreeSet<Vec<u8>>,
++    hash: impl Fn(&[u8]) -> Result<()> + Sync,
++) -> Result<()> {
++    use std::sync::{
++        Mutex,
++        atomic::{AtomicUsize, Ordering},
++    };
++
++    let ids: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
++    let workers = payload_reader::verification_workers(ids.len());
++    if workers <= 1 {
++        return ids.into_iter().try_for_each(&hash);
++    }
++    let cursor = AtomicUsize::new(0);
++    let results = Mutex::new((0..ids.len()).map(|_| None).collect::<Vec<Option<Result<()>>>>());
++    let mut spawn_error = None;
++    std::thread::scope(|scope| {
++        for _ in 0..workers {
++            let worker = std::thread::Builder::new().spawn_scoped(scope, || {
++                loop {
++                    let index = cursor.fetch_add(1, Ordering::Relaxed);
++                    let Some(id) = ids.get(index) else {
++                        break;
++                    };
++                    let result = hash(id);
++                    results.lock().expect("payload hash result mutex")[index] = Some(result);
++                }
++            });
++            if let Err(error) = worker {
++                spawn_error = Some(error);
++                break;
++            }
++        }
++    });
++    if let Some(error) = spawn_error {
++        return Err(invalid(format!("spawn payload hasher: {error}")));
++    }
++    for result in results.into_inner().expect("payload hash result mutex") {
++        result.expect("every payload hash worker must record a result")?;
++    }
++    Ok(())
++}
++
+ #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct Publisher {
+@@ -1384,7 +1543,6 @@ pub struct PayloadSource {
+     authorized: Arc<payload_auth::AuthorizedPackage>,
+ }
+ 
+-const HASH_CHUNK: usize = 4 << 20;
+ 
+ impl PayloadSource {
+     fn payload_file(&self, id: &[u8]) -> Result<(&super::archive::PayloadFile, u64)> {
+@@ -1402,21 +1560,7 @@ impl PayloadSource {
+     /// are hashed this way, never by allocating the payload.
+     pub(super) fn hash_payload(&self, id: &[u8]) -> Result<()> {
+         let (file, nbytes) = self.payload_file(id)?;
+-        let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+-        let mut buffer = vec![0u8; HASH_CHUNK];
+-        let mut offset = 0u64;
+-        while offset < nbytes {
+-            let count = usize::try_from((nbytes - offset).min(HASH_CHUNK as u64))
+-                .map_err(|_| invalid("payload hash length overflow"))?;
+-            FileReadAt::read_exact_at(&*file.file, &mut buffer[..count], file.start + offset)
+-                .map_err(|error| invalid(format!("read payload: {error}")))?;
+-            context.update(&buffer[..count]);
+-            offset += count as u64;
+-        }
+-        if context.finish().as_ref() != id {
+-            return Err(invalid("payload content verification failed"));
+-        }
+-        Ok(())
++        hash_stored(file, nbytes, id)
+     }
+     fn supporting_payload_ids(&self) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+         let mut ids = std::collections::BTreeSet::new();
+@@ -2115,31 +2259,14 @@ impl PayloadVerifiedPackage {
+             .files
+             .get(&placement.token)
+             .ok_or_else(|| invalid("payload container is not open"))?;
+-        const CHUNK: usize = 4 << 20;
+-        let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+-        let mut buffer = vec![0u8; CHUNK];
+-        let mut offset = 0u64;
+-        while offset < placement.nbytes {
+-            let count = super::protobuf::size((placement.nbytes - offset).min(CHUNK as u64))?;
+-            FileReadAt::read_exact_at(&*file.file, &mut buffer[..count], file.start + offset)
+-                .map_err(|error| invalid(format!("read payload: {error}")))?;
+-            context.update(&buffer[..count]);
+-            offset += count as u64;
+-        }
+-        if context.finish().as_ref() != id {
+-            return Err(invalid("payload content verification failed"));
+-        }
+-        Ok(())
++        hash_stored(file, placement.nbytes, id)
+     }
+     /// Hash every stored payload the selected deployment references against its signed
+     /// descriptor. This includes initializers plus selected frontend assets, module globals,
+     /// offloaded table planes, and executable resources.
+     pub fn verify_stored_data(&self) -> Result<()> {
+         let ids = payload_reader::required_payloads(&self.verified)?;
+-        for id in ids {
+-            self.hash_payload(&id)?;
+-        }
+-        Ok(())
++        hash_payloads(&ids, |id| self.hash_payload(id))
+     }
+     pub fn describe(
+         &self,
+@@ -2430,10 +2557,7 @@ impl PayloadAuthorizedPackage {
+     /// offloaded table planes, and executable resources.
+     pub fn verify_stored_data(&self) -> Result<()> {
+         let ids = payload_reader::required_payloads(self.source.authorized.verified())?;
+-        for id in ids {
+-            self.source.hash_payload(&id)?;
+-        }
+-        Ok(())
++        hash_payloads(&ids, |id| self.source.hash_payload(id))
+     }
+     pub(super) fn descriptor(&self) -> Result<wire::ModelIndex> {
+         build_descriptor(self.source.authorized.verified(), &self.packages, |use_| {
+@@ -3907,3 +4031,65 @@ mod payload_package_tests {
+         let _ = std::fs::remove_dir_all(moved);
+     }
+ }
++
++#[cfg(test)]
++mod stored_hash_tests {
++    use super::*;
++    use std::io::Write as _;
++
++    #[test]
++    fn direct_hash_matches_buffered_hash_on_unaligned_ranges() {
++        let length = 2 * DIRECT_HASH_BLOCK as u64 + 12_345;
++        let bytes: Vec<u8> = (0..length).map(|i| (i * 31 % 251) as u8).collect();
++        let directory =
++            std::env::temp_dir().join(format!("helios-stored-hash-{}", std::process::id()));
++        std::fs::create_dir_all(&directory).unwrap();
++        let path = directory.join("payload.bin");
++        File::create(&path).unwrap().write_all(&bytes).unwrap();
++        let file = File::open(&path).unwrap();
++        let result = std::panic::catch_unwind(|| check(&file, &bytes, length));
++        std::fs::remove_dir_all(&directory).unwrap();
++        if let Err(panic) = result {
++            std::panic::resume_unwind(panic);
++        }
++    }
++
++    fn check(file: &File, bytes: &[u8], length: u64) {
++        let block = DIRECT_HASH_BLOCK as u64;
++        let direct = match crate::os::direct_reopen(file) {
++            Ok(direct) => direct,
++            Err(error) => {
++                eprintln!("skipping: the temporary directory refuses direct I/O: {error}");
++                return;
++            }
++        };
++        let ranges = [
++            (0, 1),
++            (0, length),
++            (1, length - 1),
++            (4095, 4097),
++            (block - 7, 14),
++            (block - 1, block + 2),
++            (3, 2 * block),
++            (length - 5, 5),
++        ];
++        for (start, nbytes) in ranges {
++            let expected = digest::digest(
++                &digest::SHA256,
++                &bytes[start as usize..(start + nbytes) as usize],
++            );
++            let buffered = hash_buffered(file, start, nbytes).unwrap();
++            assert_eq!(buffered.as_ref(), expected.as_ref(), "buffered {start}+{nbytes}");
++            match hash_direct(&direct, start, nbytes) {
++                Ok(found) => assert_eq!(found.as_ref(), expected.as_ref(), "direct {start}+{nbytes}"),
++                Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
++                    eprintln!("skipping direct: {error}");
++                    return;
++                }
++                Err(error) => panic!("direct {start}+{nbytes}: {error}"),
++            }
++        }
++        // A range past the end of the file is a read error, not a short digest.
++        assert!(hash_direct(&direct, length - 3, 10).is_err());
++    }
++}
+-- 
+2.43.0
+

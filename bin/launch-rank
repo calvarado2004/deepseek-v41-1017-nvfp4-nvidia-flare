@@ -92,19 +92,33 @@ echo "DeepSeek-V4.1-Flash-1017 on Flare tp=4 rank=$NODE_RANK package=${PACKAGE:-
 "$FLARE" "${args[@]}" < /dev/null &
 rank_pid=$!
 
+# Flight recorder (bin/flare-recorder): host state on every rank, /metrics on rank 0, kept in
+# DSV41F_LOG_DIR. Flare logs no load, so this is the only record of the minutes before a
+# failure. One final record after the rank exits.
+python3 -I "$RUNTIME_ROOT/bin/flare-recorder" "$NODE_RANK" "$rank_pid" &
+recorder_pid=$!
+finish() {
+  local status=0
+  wait "$rank_pid" || status=$?
+  kill "$recorder_pid" 2>/dev/null || true
+  timeout 30 python3 -I "$RUNTIME_ROOT/bin/flare-recorder" --once "$NODE_RANK" "$rank_pid" || true
+  echo "flare rank $NODE_RANK exited with status $status"
+  exit "$status"
+}
+
 # Headless ranks report ready once the rank runs (gating them on the head deadlocks a
 # start that brings the peers up first).
 if [ "$NODE_RANK" != 0 ]; then
   sleep 2
   kill -0 "$rank_pid" 2>/dev/null && [ -n "${NOTIFY_SOCKET:-}" ] \
     && systemd-notify --ready --status="rank $NODE_RANK, at the rendezvous $MASTER_ADDR:$MASTER_PORT"
-  wait "$rank_pid"; exit $?
+  finish
 fi
 
-# Rank 0: the TLS front lives and dies with the rank.
+# Rank 0: the TLS front lives and dies with the rank. It logs one req/end line per request.
 python3 -I "$RUNTIME_ROOT/bin/tls-front.py" &
 front_pid=$!
-trap 'kill "$front_pid" 2>/dev/null || true' EXIT
+trap 'kill "$front_pid" "$recorder_pid" 2>/dev/null || true' EXIT
 
 (
   base="https://127.0.0.1:${PORT}"
@@ -128,4 +142,4 @@ trap 'kill "$front_pid" 2>/dev/null || true' EXIT
   done
   [ -n "${NOTIFY_SOCKET:-}" ] && systemd-notify --status="not ready after ${DSV41F_READY_TIMEOUT:-1800}s"
 ) &
-wait "$rank_pid"
+finish

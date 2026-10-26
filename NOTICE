@@ -3,7 +3,7 @@ Copyright (c) 2026 Carlos Alvarado Martinez — MIT, see LICENSE.
 
 This repository includes third-party material under its own licenses:
 
-- patches/0004, 0007, 0008: changes to NVIDIA/flare-local-inference (Apache-2.0) at
+- patches/0004, 0007, 0008, 0009: changes to NVIDIA/flare-local-inference (Apache-2.0) at
   bce032c014bae34502ba22d3304fa084d5b40afe; they are Apache-2.0 like the code
   they change. 0008 is also proposed upstream on NVIDIA/flare-local-inference#47.
 - bin/dsv41_video_frames.py: from calvarado2004/deepseek-v41-1017-nvfp4 (MIT,

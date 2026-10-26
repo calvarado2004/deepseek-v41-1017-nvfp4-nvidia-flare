@@ -3,6 +3,7 @@
 #   runtime  /opt/spark-llm/profiles/deepseek-v41-1017-flare/bin
 #   env      /etc/spark-llm/profiles/deepseek-v41-1017-flare.env (+ DSV41F_MASTER_ADDR)
 #   unit     /etc/systemd/system/spark-llm-dsv41-flare@.service (+ SPARK_USER, SPARK_RING_PEERS)
+#   logs     /var/log/spark-llm/dsv41-flare (bin/flare-recorder)
 # Build (scripts/build-flare.sh), fetch and export are separate steps: they compile or
 # move hundreds of GB. The first start after an export sends the peers their ranges.
 set -euo pipefail
@@ -40,6 +41,8 @@ for i in "${!hosts[@]}"; do
   ssh -n "$h" "set -e
     sudo install -m 644 /tmp/deepseek-v41-1017-flare.env /etc/spark-llm/profiles/deepseek-v41-1017-flare.env
     sudo install -m 644 '/tmp/$U' /etc/systemd/system/
+    # bin/flare-recorder writes here (metrics on rank 0, host state on every rank).
+    sudo install -d -o $SPARK_USER -g $SPARK_USER -m 755 /var/log/spark-llm/dsv41-flare
     sudo systemctl daemon-reload
     ! grep -q '^\[Install\]' '/etc/systemd/system/$U'
     [ -x $FLARE_SRC/flare/target/release/flare ] && echo '  flare present' || echo '  flare MISSING (scripts/build-flare.sh)'

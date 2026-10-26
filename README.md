@@ -110,7 +110,7 @@ average over a long Max-effort request is lower than the code-phase peak.
 
 | Layer | Choice |
 |---|---|
-| Engine | Flare `bce032c` (main, 2026-10-24) + 3 patches (`patches/`), built from source on each node |
+| Engine | Flare `bce032c` (main, 2026-10-24) + 4 patches (`patches/`), built from source on each node |
 | Package | `ignition export` at TP=4 with `--roce-ring`, max concurrency 4, 5 DSpark drafts, prefill chunk 4,096, csf expert-scale compression |
 | Experts | MXFP4, as DeepSeek publishes them (Flare's stock deepseek41 recipe) |
 | Engram tables | FP8 E4M3 rows, as published; read from NVMe through a 6G row cache |
@@ -127,6 +127,8 @@ average over a long Max-effort request is lower than the code-phase peak.
 | 0004 | A request with `tool_choice: "required"` that asks for no thinking mode is encoded in chat mode. Flare thinks by default, so these requests got HTTP 400 "thinking mode does not support required tool choice"; Qwen Code sends them for its side queries. A request that asks for thinking and forces a tool still gets the 400. |
 | 0007 | Literal `<｜image｜>` and `<｜deepseek_image｜>` in request text are plain text, not image placeholders. Flare returned HTTP 400 "literal DeepSeek image placeholder is ambiguous" for the rest of an agent session once a tool result had read a DeepSeek tokenizer, template or recipe file (Qwen Code at 155K tokens). |
 | 0008 | Long conversations stay warm under snapshot-slot pressure ([Flare issue #47](https://github.com/NVIDIA/flare-local-inference/issues/47)). Flare keeps eight snapshot slots per concurrent request (32 here) and evicted the least recently used. A Qwen Code session shares them with its own subagents and side queries, so after a few minutes of subagent work its next turn prefilled the whole 381K-token context again, with 22M KV tokens free. The patch evicts by GreedyDual-Size over the tokens an eviction loses (a long conversation outlasts many short ones, an idle one still ages out) and adds `--prefix-cache-snapshots N`; this recipe sets 256. Unit and scheduler tests fail on the unpatched pin and pass with the patch; `qualify/prefix_retention.py` (in the patch) runs the scenario on a live server. |
+
+| 0009 | Fast warm starts. On every start each peer re-hashes its cached rank (about 280 GB) before it serves; Flare keeps this check on purpose, so a damaged copy is fetched again. The hash read and hashed one payload after another on one thread through 4 MiB page-cache reads: 0.6 GB/s, while one core hashes SHA-256 at 2.5 GB/s and the NVMe reads 9–13 GB/s. The patch hashes on Flare's package verification workers (at most 8), and reads each payload in 16 MiB direct-I/O blocks on a second thread while the previous block is hashed. The two 98 GB Engram planes now set the time. The check is the same (the upstream corrupted-cache test passes; a new unit test compares direct and buffered digests). The distribute step went from 425–514 s to 46.5 s, and start to serving from 7–9.5 min to 71 s. The reads also stay out of the page cache, which is GPU memory on GB10. |
 
 Upstream `bce032c` already carries the fixes of this recipe's earlier patches:
 0002 (shared memory, [#2](https://github.com/NVIDIA/flare-local-inference/issues/2), `37c87e1d`),
@@ -171,9 +173,11 @@ boundaries from one tokenization, `67ba265e`, `03940fa5`).
 7. **Start** ranks 1–3, then rank 0:
    `sudo systemctl start spark-llm-dsv41-flare@{1,2,3}` and `…@0`. The first
    start after an export sends each peer its ranges (about 280 GB written and
-   read back on each peer: about 10 minutes); later starts load in under a
-   minute. Rank 0 reports ready when `/health` answers and a warm-up burst is
-   done. Logs: `journalctl -u spark-llm-dsv41-flare@N`.
+   read back on each peer: about 10 minutes); later starts take about 71 s
+   (patch 0009). Rank 0 reports ready when `/health` answers and a warm-up burst
+   is done. Logs: see [Logs](#logs).
+   If you built Flare before patch 0009, stop the card and run
+   `scripts/build-flare.sh` again on every node.
 8. **Test** on the head: `python3 -I tests/smoke.py`.
 
 The API is on `https://<head>:8888/v1`, model `DeepSeek-V4.1-Flash-1017-Flare`.
@@ -181,6 +185,24 @@ The API is on `https://<head>:8888/v1`, model `DeepSeek-V4.1-Flash-1017-Flare`.
 here, not on the nodes. Re-export (step 4) after a Flare update that changes the
 package format; a new pin refuses an old package with "signed format-6 package
 required; re-export the checkpoint".
+
+## Logs
+
+`flare run` prints its start phases and errors only; it has no request log or log
+level. The recipe adds two records:
+
+- **Requests**, in rank 0's journal (`journalctl -u spark-llm-dsv41-flare@0`), from
+  the TLS front: `req N <client> <path> <bytes> msgs= tools= stream= max_tokens= inflight=`
+  when a request goes to Flare, and `end N <status> ttfb= total= out= inflight= prompt=
+  completion= cached= [error=...]` when its response ends. The prompt text is never
+  logged. `no-response` and `-cut` mark requests that a failure cut off.
+- **Flight recorder** (`bin/flare-recorder`), in `/var/log/spark-llm/dsv41-flare/`:
+  `metrics-YYYYMMDD.jsonl` on rank 0 every 5 s (the `flare_*` series and how long
+  `/metrics` took to answer: a stalled rank 0 shows as a slow or failed sample), and
+  `host-YYYYMMDD.jsonl` on every rank every 60 s plus once after the rank exits
+  (memory, pressure, the rank process, fabric PHY and RDMA error counters, GPU clocks
+  and throttle reasons). Counters are totals: diff two records. Older days are gzipped;
+  files go after 14 days.
 
 ## Requests
 
@@ -201,6 +223,12 @@ required; re-export the checkpoint".
   agent session keeps its prefix while short requests churn the 256 slots
   (tested at 300K tokens); the 900K-token run of `qualify/prefix_retention.py`
   is still to do.
+- **A stall on one rank stops all four.** If a rank does not reach a collective in
+  time, its neighbor reports `RoCE collective on rank A timed out waiting for rank B
+  ... the transport is poisoned`, and every rank exits. Flare has no recovery for
+  this (`docs/roce-ring.md`): start all ranks again. We saw it once, after 18.7 hours
+  up, with clean links, NIC counters and host memory; the cause is open. The logs
+  above are there to catch the next one.
 - Flare's docs call physical ring cabling and full-model ring serving
   "unqualified". This recipe is a community result on that path, not an NVIDIA
   configuration.
@@ -209,9 +237,10 @@ required; re-export the checkpoint".
 
 ```
 bin/launch-rank                 one rank: flare run with the recipe's settings; rank 0 adds HTTP and the TLS front
-bin/tls-front.py                TLS on :8888, video parts become frames
+bin/tls-front.py                TLS on :8888, video parts become frames, one req/end log line per request
+bin/flare-recorder              flight recorder: /metrics (rank 0) and host state (every rank) to /var/log/spark-llm/dsv41-flare
 bin/dsv41_video_frames.py       the frame sampler (from the vLLM recipe)
-patches/                        0004, 0007, 0008 for Flare bce032c (see NOTICE)
+patches/                        0004, 0007, 0008, 0009 for Flare bce032c (see NOTICE)
 scripts/build-flare.sh          build patched Flare on one node
 scripts/fetch.sh                the official checkpoint to rank 0
 scripts/export.sh               four-rank ignition export / join into rank 0's model cache
