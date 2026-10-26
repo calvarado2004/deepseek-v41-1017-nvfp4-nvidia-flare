@@ -120,6 +120,7 @@ average over a long Max-effort request is lower than the code-phase peak.
 | HTTPS | `bin/tls-front.py`: TLS 1.2+ on :8888 in front of Flare's plain HTTP on 127.0.0.1:8001 |
 | Warm start | 71 s from start to serving (patch 0009); the first start after an export about 10 minutes |
 | Logs | one `req`/`end` line per request in rank 0's journal, and a flight recorder on every rank (see [Logs](#logs)) |
+| Crash recovery | a crash of the serving card restarts all four ranks, at most 3 times in 24 h (see [Crash recovery](#crash-recovery)) |
 | Video | the TLS front turns `video_url` parts into timestamped JPEG frames (`bin/dsv41_video_frames.py`, the vLLM recipe's module) |
 
 ### The patches
@@ -206,6 +207,29 @@ level. The recipe adds two records:
   and throttle reasons). Counters are totals: diff two records. Older days are gzipped;
   files go after 14 days.
 
+## Crash recovery
+
+A crash of one rank stops all four (see [Known gaps](#known-gaps)). Rank 0's unit has
+`OnFailure=spark-llm-dsv41-flare-recover.service` (a drop-in on rank 0 only), which runs
+`bin/recover-card` as `SPARK_USER`. It waits 20 s, then starts ranks 1–3 and rank 0 again,
+only when all of these hold:
+
+- the card was serving: a run that failed during its start stays down, so a broken
+  start cannot loop;
+- nothing was stopping it: a stop job on rank 0 or on any peer means a stop, not a
+  crash (a plain `systemctl stop` of rank 0 ends "Deactivated successfully" and never
+  triggers it);
+- fewer than `DSV41F_RECOVER_MAX` (3) restarts in the last `DSV41F_RECOVER_WINDOW`
+  (24 h): the next crash stays down for a person.
+
+It checks again after the 20 s wait, so a stop in that time cancels the restart. Every
+decision is in `journalctl -u spark-llm-dsv41-flare-recover` and in
+`/var/log/spark-llm/dsv41-flare/recover.log`; the restarts in the window are in
+`restarts.txt` next to it. `DSV41F_RECOVER_MAX=0` turns it off. Tested on the four
+Sparks: `kill -9` of rank 0 was serving again in 99 s; a stop left all four down.
+Rank 0 reaches ranks 1–3 over SSH as `SPARK_USER` (`SPARK_RECOVER_PEERS` in
+`cluster.env` if their names differ from the head).
+
 ## Requests
 
 - Thinking is on by default. `reasoning_effort` takes `low`, `high`, `xhigh`,
@@ -230,7 +254,8 @@ level. The recipe adds two records:
   ... the transport is poisoned`, and every rank exits. Flare has no recovery for
   this (`docs/roce-ring.md`): start all ranks again. We saw it once, after 18.7 hours
   up, with clean links, NIC counters and host memory; the cause is open. The logs
-  above are there to catch the next one.
+  above are there to catch the next one, and [crash recovery](#crash-recovery)
+  starts the ranks again.
 - Flare's docs call physical ring cabling and full-model ring serving
   "unqualified". This recipe is a community result on that path, not an NVIDIA
   configuration.
@@ -241,6 +266,7 @@ level. The recipe adds two records:
 bin/launch-rank                 one rank: flare run with the recipe's settings; rank 0 adds HTTP and the TLS front
 bin/tls-front.py                TLS on :8888, video parts become frames, one req/end log line per request
 bin/flare-recorder              flight recorder: /metrics (rank 0) and host state (every rank) to /var/log/spark-llm/dsv41-flare
+bin/recover-card                crash recovery on rank 0: restart all ranks, at most 3 times in 24 h
 bin/dsv41_video_frames.py       the frame sampler (from the vLLM recipe)
 patches/                        0004, 0007, 0008, 0009 for Flare bce032c (see NOTICE)
 scripts/build-flare.sh          build patched Flare on one node
@@ -248,7 +274,7 @@ scripts/fetch.sh                the official checkpoint to rank 0
 scripts/export.sh               four-rank ignition export / join into rank 0's model cache
 scripts/publisher.sh            the development key's public profile to every node
 scripts/stage.sh                bin, env and unit to the four nodes
-systemd/                        the Type=notify unit, one rank per node (no [Install]: never start at boot)
+systemd/                        the Type=notify unit, one rank per node (no [Install]: never start at boot), and rank 0's recovery unit and drop-in
 tests/smoke.py                  six one-request checks
 tests/profile-decode.py         per-round wall time vs GPU time of one decode
 examples/neon-city/             a one-shot run: untouched output, recording

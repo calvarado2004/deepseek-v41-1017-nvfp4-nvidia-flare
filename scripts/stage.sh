@@ -4,6 +4,7 @@
 #   env      /etc/spark-llm/profiles/deepseek-v41-1017-flare.env (+ DSV41F_MASTER_ADDR)
 #   unit     /etc/systemd/system/spark-llm-dsv41-flare@.service (+ SPARK_USER, SPARK_RING_PEERS)
 #   logs     /var/log/spark-llm/dsv41-flare (bin/flare-recorder)
+#   recovery rank 0 only: spark-llm-dsv41-flare-recover.service + the @0 drop-in recover.conf
 # Build (scripts/build-flare.sh), fetch and export are separate steps: they compile or
 # move hundreds of GB. The first start after an export sends the peers their ranges.
 set -euo pipefail
@@ -18,9 +19,12 @@ read -r -a hosts <<< "$SPARK_HOSTS"
 U=spark-llm-dsv41-flare@.service
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 { cat "$here/deepseek-v41-1017-flare.env"; echo; echo "# from cluster.env"
-  echo "DSV41F_MASTER_ADDR=$SPARK_HEAD_FABRIC"; } > "$tmp/deepseek-v41-1017-flare.env"
-sed -e "s/@SPARK_USER@/$SPARK_USER/g" -e "s/@SPARK_RING_PEERS@/$SPARK_RING_PEERS/g" \
-  "$here/systemd/$U" > "$tmp/$U"
+  echo "DSV41F_MASTER_ADDR=$SPARK_HEAD_FABRIC"
+  echo "DSV41F_RECOVER_PEERS=\"${SPARK_RECOVER_PEERS:-${hosts[*]:1:3}}\""; } > "$tmp/deepseek-v41-1017-flare.env"
+for f in "$U" spark-llm-dsv41-flare-recover.service; do
+  sed -e "s/@SPARK_USER@/$SPARK_USER/g" -e "s/@SPARK_RING_PEERS@/$SPARK_RING_PEERS/g" \
+    "$here/systemd/$f" > "$tmp/$f"
+done
 for i in "${!hosts[@]}"; do
   h="${hosts[$i]}"
   echo "== $h (rank $i)"
@@ -31,6 +35,14 @@ for i in "${!hosts[@]}"; do
     ssh -n "$h" "python3 -c 'import cv2' 2>/dev/null || sudo apt-get install -y -q python3-opencv >/dev/null"
   fi
   scp -q "$tmp/deepseek-v41-1017-flare.env" "$tmp/$U" "$h:/tmp/"
+  if [ "$i" = 0 ]; then
+    # Crash recovery lives on rank 0: its failure is the trigger (bin/recover-card).
+    scp -q "$tmp/spark-llm-dsv41-flare-recover.service" "$here/systemd/recover.conf" "$h:/tmp/"
+    ssh -n "$h" "set -e
+      sudo install -m 644 /tmp/spark-llm-dsv41-flare-recover.service /etc/systemd/system/
+      sudo install -d /etc/systemd/system/spark-llm-dsv41-flare@0.service.d
+      sudo install -m 644 /tmp/recover.conf /etc/systemd/system/spark-llm-dsv41-flare@0.service.d/recover.conf"
+  fi
   # Rank 0 serves the export's cache entry; peers receive their ranges from it at start.
   if [ "$i" = 0 ]; then
     entry="${DSV41F_PACKAGE:-\$HOME/.cache/flare/packages/models/*/*/model.safetensors}"

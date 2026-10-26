@@ -1,0 +1,14 @@
+[Unit]
+Description=Restart the NVIDIA Flare DeepSeek-V4.1-Flash-1017 card after a crash (at most 3 times in 24 h)
+# Started by OnFailure= of spark-llm-dsv41-flare@0 (drop-in recover.conf, rank 0 only).
+# bin/recover-card decides: only a card that was serving and was not being stopped.
+
+[Service]
+Type=oneshot
+# The account from cluster.env (SPARK_USER): it reaches ranks 1-3 over SSH with sudo.
+User=@SPARK_USER@
+Group=@SPARK_USER@
+Environment=HOME=/home/@SPARK_USER@
+EnvironmentFile=-/etc/spark-llm/profiles/deepseek-v41-1017-flare.env
+ExecStart=/opt/spark-llm/profiles/deepseek-v41-1017-flare/bin/recover-card
+TimeoutStartSec=600

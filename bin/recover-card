@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Restart the DeepSeek-V4.1-Flash-1017 Flare card after a crash, at most DSV41F_RECOVER_MAX
+# times (3) in DSV41F_RECOVER_WINDOW seconds (24 h). Runs on rank 0's host as the OnFailure=
+# unit of spark-llm-dsv41-flare@0 (stage.sh installs that drop-in on rank 0 only).
+#
+# A crash of one rank stops all four: its neighbor's RoCE collective times out, the transport
+# is poisoned and every rank exits (2026-10-26 10:21; upstream docs/roce-ring.md: no recovery,
+# start all ranks again). Rank 0's failure is therefore the one trigger, and the restart is
+# the documented one: every rank, peers first.
+#
+# Restarts only a card that was serving and was not being stopped:
+#   - a run that never reached active (bad env, missing package, a restart that failed) stays
+#     down, so a broken start cannot loop;
+#   - a run that systemd was stopping (systemctl stop, a Conflicts= switch to another model)
+#     is a stop, even when Flare exits non-zero on SIGTERM; the same for a peer, because a
+#     stopped peer makes rank 0 fail on its own. A plain stop of rank 0 ends "Deactivated
+#     successfully" and never reaches this at all (the peers then exit with status 0);
+#   - both checks run again after the delay, so a stop or reset-failed that lands while this
+#     waits cancels the restart;
+#   - another profile running on this host wins.
+# Each restart is a line in $STATE; the crash after DSV41F_RECOVER_MAX restarts in the window
+# stays down for a person. DSV41F_RECOVER_MAX=0 turns recovery off.
+# DSV41F_RECOVER_DRYRUN=1 prints the decision and the commands without running them.
+set -euo pipefail
+
+UNIT=spark-llm-dsv41-flare@0.service
+MAX="${DSV41F_RECOVER_MAX:-3}"
+WINDOW="${DSV41F_RECOVER_WINDOW:-86400}"
+DELAY="${DSV41F_RECOVER_DELAY:-20}"
+# ssh names of ranks 1..3, in rank order, as this host reaches them (scripts/stage.sh writes
+# them from cluster.env).
+read -r -a PEERS <<< "${DSV41F_RECOVER_PEERS:-}"
+if [ "${#PEERS[@]}" -ne 3 ]; then
+  echo "recover: DSV41F_RECOVER_PEERS must name ranks 1, 2 and 3 (scripts/stage.sh sets it)" >&2
+  exit 1
+fi
+LOG_DIR="${DSV41F_LOG_DIR:-/var/log/spark-llm/dsv41-flare}"
+STATE="$LOG_DIR/restarts.txt"
+SSH=(ssh -n -o BatchMode=yes -o ConnectTimeout=10)
+
+log() {
+  echo "recover: $*"
+  echo "$(date -Is) $*" >> "$LOG_DIR/recover.log" 2>/dev/null || true
+}
+run() {
+  if [ "${DSV41F_RECOVER_DRYRUN:-0}" = 1 ]; then echo "dry-run: $*"; else "$@"; fi
+}
+show() { systemctl show "$UNIT" -p "$1" --value; }
+# Was this run of the unit ended by a stop job? systemd logs "Stopping <unit>" under the
+# run's INVOCATION_ID; a crash has none.
+stopped_peer() {
+  local rank host unit
+  for rank in 1 2 3; do
+    host="${PEERS[$((rank - 1))]}"
+    unit="spark-llm-dsv41-flare@$rank.service"
+    if "${SSH[@]}" "$host" "id=\$(systemctl show $unit -p InvocationID --value); [ -n \"\$id\" ] && journalctl --no-pager -o cat INVOCATION_ID=\$id | grep -q '^Stopping '"; then
+      echo "rank $rank on $host"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ "$MAX" -le 0 ]; then
+  log "rank 0 failed; recovery is off (DSV41F_RECOVER_MAX=$MAX)"
+  exit 0
+fi
+
+result=$(show Result)
+invocation=$(show InvocationID)
+started=$(show ExecMainStartTimestampMonotonic)
+active=$(show ActiveEnterTimestampMonotonic)
+state=$(show ActiveState)
+
+if [ "$state" != failed ] && [ "${DSV41F_RECOVER_DRYRUN:-0}" != 1 ]; then
+  log "rank 0 is $state, not failed; nothing to do"
+  exit 0
+fi
+if [ "${active:-0}" -le "${started:-0}" ]; then
+  log "rank 0 failed ($result) before it served; left down"
+  exit 0
+fi
+if [ -n "$invocation" ] && journalctl --no-pager -o cat INVOCATION_ID="$invocation" | grep -q '^Stopping '; then
+  log "rank 0 exited ($result) while it was being stopped; not a crash"
+  exit 0
+fi
+if peer=$(stopped_peer); then
+  log "rank 0 failed ($result) after $peer was stopped; not a crash"
+  exit 0
+fi
+other=$(systemctl list-units --plain --no-legend --state=active,activating 'spark-llm-*@0.service' \
+        | awk '{print $1}' | grep -v "^$UNIT\$" || true)
+if [ -n "$other" ]; then
+  log "rank 0 failed ($result), but $other is running here; left down"
+  exit 0
+fi
+
+now=$(date +%s)
+recent=()
+if [ -f "$STATE" ]; then
+  while read -r when _; do
+    [[ "$when" =~ ^[0-9]+$ ]] && [ $(( now - when )) -lt "$WINDOW" ] && recent+=("$when")
+  done < "$STATE"
+fi
+if [ "${#recent[@]}" -ge "$MAX" ]; then
+  log "rank 0 crashed ($result); ${#recent[@]} restarts in the last ${WINDOW}s already, budget $MAX: left down"
+  exit 0
+fi
+
+count=$(( ${#recent[@]} + 1 ))
+log "rank 0 crashed ($result); restart $count of $MAX in ${WINDOW}s, in ${DELAY}s"
+if [ "${DSV41F_RECOVER_DRYRUN:-0}" != 1 ]; then
+  { for when in "${recent[@]}"; do grep -m1 "^$when " "$STATE" || echo "$when"; done
+    echo "$now $(date -Is) $result"; } > "$STATE.new"
+  mv -f "$STATE.new" "$STATE"
+fi
+run sleep "$DELAY"
+
+# A stop or reset that arrived while this waited.
+now_state=$(show ActiveState)
+if [ "${DSV41F_RECOVER_DRYRUN:-0}" != 1 ] && [ "$now_state" != failed ]; then
+  log "rank 0 is $now_state after ${DELAY}s (stopped or reset meanwhile); restart cancelled"
+  exit 0
+fi
+if peer=$(stopped_peer); then
+  log "$peer was stopped while this waited; restart cancelled"
+  exit 0
+fi
+
+# Peers exit seconds after rank 0; one that still runs holds a poisoned transport.
+for rank in 1 2 3; do
+  host="${PEERS[$((rank - 1))]}"
+  unit="spark-llm-dsv41-flare@$rank.service"
+  peer_state=$("${SSH[@]}" "$host" systemctl is-active "$unit" || true)
+  if [ "$peer_state" = active ] || [ "$peer_state" = activating ]; then
+    log "rank $rank on $host is still $peer_state; stopping it"
+    run "${SSH[@]}" "$host" sudo -n systemctl stop "$unit"
+  fi
+done
+for rank in 1 2 3; do
+  host="${PEERS[$((rank - 1))]}"
+  unit="spark-llm-dsv41-flare@$rank.service"
+  run "${SSH[@]}" "$host" "sudo -n systemctl reset-failed $unit 2>/dev/null; sudo -n systemctl start $unit"
+  log "rank $rank on $host: $("${SSH[@]}" "$host" systemctl is-active "$unit" || true)"
+done
+run sudo -n systemctl reset-failed "$UNIT"
+# --no-block: this unit is rank 0's OnFailure= job; rank 0 reports ready itself.
+run sudo -n systemctl start --no-block "$UNIT"
+log "rank 0 start queued (restart $count of $MAX)"
