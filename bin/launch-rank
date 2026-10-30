@@ -30,7 +30,7 @@ fi
 NODE_RANK="$1"
 
 RUNTIME_ROOT="${DSV41F_RUNTIME_ROOT:-/opt/spark-llm/profiles/deepseek-v41-1017-flare}"
-FLARE="${DSV41F_FLARE:-$RUNTIME_ROOT/src-bce032c0/flare/target/release/flare}"
+FLARE="${DSV41F_FLARE:-$RUNTIME_ROOT/src-085ae4a7/flare/target/release/flare}"
 # Rank 0 only: the model.safetensors of the export's cache entry (scripts/export.sh).
 PACKAGE="${DSV41F_PACKAGE:-}"
 PUBLISHER_KEY="${DSV41F_PUBLISHER_KEY:-}"

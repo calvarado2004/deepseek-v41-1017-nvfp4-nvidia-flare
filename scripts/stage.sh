@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage the card on the four Sparks. Starts nothing and pulls nothing.
 #   runtime  /opt/spark-llm/profiles/deepseek-v41-1017-flare/bin
-#   env      /etc/spark-llm/profiles/deepseek-v41-1017-flare.env (+ DSV41F_MASTER_ADDR)
+#   env      /etc/spark-llm/profiles/deepseek-v41-1017-flare.env (+ DSV41F_MASTER_ADDR, DSV41F_FLARE)
 #   unit     /etc/systemd/system/spark-llm-dsv41-flare@.service (+ SPARK_USER, SPARK_RING_PEERS)
 #   logs     /var/log/spark-llm/dsv41-flare (bin/flare-recorder)
 #   recovery rank 0 only: spark-llm-dsv41-flare-recover.service + the @0 drop-in recover.conf
@@ -20,6 +20,7 @@ U=spark-llm-dsv41-flare@.service
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 { cat "$here/deepseek-v41-1017-flare.env"; echo; echo "# from cluster.env"
   echo "DSV41F_MASTER_ADDR=$SPARK_HEAD_FABRIC"
+  echo "DSV41F_FLARE=$FLARE_SRC/flare/target/release/flare"
   echo "DSV41F_RECOVER_PEERS=\"${SPARK_RECOVER_PEERS:-${hosts[*]:1:3}}\""; } > "$tmp/deepseek-v41-1017-flare.env"
 for f in "$U" spark-llm-dsv41-flare-recover.service; do
   sed -e "s/@SPARK_USER@/$SPARK_USER/g" -e "s/@SPARK_RING_PEERS@/$SPARK_RING_PEERS/g" \

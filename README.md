@@ -18,23 +18,31 @@ The same model on the same four Sparks under vLLM is
 (LibertAIDAI's NVFP4 transcode of these weights).
 Flare is faster for one request and for four.
 
-| Measured, one stream unless noted (tok/s) | Flare `bce032c`, official weights (2026-10-25, evening) | Flare `5f37bd1`, LibertAIDAI NVFP4 (2026-10-22) | vLLM recipe |
-|---|---:|---:|---:|
-| Count to 100 (median of 3; runs) | **129.2** (120.3 / 129.2 / 129.7) | 98.1 | 81 |
-| Code (median of 3; runs) | **109.3** (91.1 / 110.2 / 109.3) | 89.3 | 75 |
-| Prose, English (median of 3; runs) | **57.5** (57.2 / 59.6 / 57.5) | 41.6 | 32 |
-| Prose, Spanish (median of 3; runs) | **54.4** (54.4 / 54.0 / 55.5) | 43.9 | – |
-| Two prose streams, aggregate | **87.0** (43.6 + 45.2) | 66.8 | – |
-| `code_bench`, 1 stream (median of 3; runs) | **91.9** (95.2 / 91.9 / 89.5) | 73.8 | 61.2 |
-| `code_bench`, 4 streams, aggregate (median of 3; runs) | **160.2** (160.2 / 159.4 / 172.0; 40.0 per stream) | 84.4 | 126.4 |
-| Cold prefill, 20K tokens (tok/s) | **3,737** | 3,344 | ~3,500 |
+| Measured, one stream unless noted (tok/s) | Flare `085ae4a7`, driver 615 (2026-10-30) | Flare `bce032c`, driver 580 (2026-10-25) | Flare `5f37bd1`, LibertAIDAI NVFP4 (2026-10-22) | vLLM recipe |
+|---|---:|---:|---:|---:|
+| Count to 100 (median of 3; runs) | **133.5** (134.2 / 129.7 / 133.5) | 129.2 (120.3 / 129.2 / 129.7) | 98.1 | 81 |
+| Code (median of 3; runs) | **109.9** (109.9 / 108.2 / 114.1) | 109.3 (91.1 / 110.2 / 109.3) | 89.3 | 75 |
+| Prose, English (median of 3; runs) | **61.4** (61.3 / 61.4 / 61.6) | 57.5 (57.2 / 59.6 / 57.5) | 41.6 | 32 |
+| Prose, Spanish (median of 3; runs) | **60.6** (62.3 / 60.2 / 60.6) | 54.4 (54.4 / 54.0 / 55.5) | 43.9 | – |
+| Two prose streams, aggregate | **92.0** (46.0 + 50.2) | 87.0 (43.6 + 45.2) | 66.8 | – |
+| `code_bench`, 1 stream (median of 3; runs) | not run | **91.9** (95.2 / 91.9 / 89.5) | 73.8 | 61.2 |
+| `code_bench`, 4 streams, aggregate (median of 3; runs) | not run | **160.2** (160.2 / 159.4 / 172.0; 40.0 per stream) | 84.4 | 126.4 |
+| Cold prefill, 20K tokens (tok/s) | 3,621 | **3,737** | 3,344 | ~3,500 |
 
 `bench.py` rows: 350-word answers at temperature 0, low effort, 3 runs, on an idle
 card. `code_bench` rows: eight coding tasks, 512 tokens each (`ignore_eos`),
-thinking off, temperature 0. Same settings in both Flare columns: adaptive DSpark verification, the
+thinking off, temperature 0. Same settings in all Flare columns: adaptive DSpark verification, the
 Engram row cache at 6G, and the rendezvous on the fabric (see "Three settings
-that decide the speed"). The `bce032c` column is the current recipe: upstream
-Flare of 2026-10-24 and a new export of the same weights.
+that decide the speed"). The `085ae4a7` column is the current recipe: `bce032c`
+plus one upstream change, FlashInfer `43eaf93f` (packed MLA and native MXFP4 MoE
+kernels), and a new export of the same weights.
+
+Why `085ae4a7` and not a newer pin: on code, a decode round (the target model
+verifies the drafts) takes 40.8 ms on the GPU instead of 43.2 ms, and DSpark
+still accepts 78% of the drafts (`tests/profile-decode.py`, 3 code requests).
+Upstream `eb71702b` (2026-10-28) had the same faster rounds, but code accepted
+74% and gave 9% fewer tokens per round: 98.9 tok/s on code. The long-context,
+chat and quality results below were measured on `bce032c`.
 
 **Long context** (`bce032c`, one stream, thinking off, a 400-word story after
 the context):
@@ -82,7 +90,7 @@ average over a long Max-effort request is lower than the code-phase peak.
 
 | Check (official weights, 2026-10-25) | Result |
 |---|---|
-| `tests/smoke.py` (6 checks) on `bce032c` | 6/6 |
+| `tests/smoke.py` (6 checks) on `085ae4a7` and on `bce032c` | 6/6 |
 | Long agent session stays warm (`qualify/prefix_retention.py`, patch 0008, `bce032c`): a 299.5K-token conversation, then 64 three-turn side conversations (554 snapshot evictions), then a follow-up turn | **299,522 tokens cached, first token in 0.6 s**, recalls the code from the first message |
 | Count to 100, 3 runs | exact 3/3 |
 | Deduction puzzle | correct ("dog"), 4,548 tokens, no loops, no foreign script |
@@ -102,15 +110,42 @@ average over a long Max-effort request is lower than the code-phase peak.
   and the shared data into their own model cache.
 - Four QSFP cables in a ring: rank 0 → 1 → 2 → 3 → 0, each cable on its own
   /24. The vLLM recipe's README describes the cabling and addresses we use.
+- **NVIDIA driver 615.71.09** on every node. All the `085ae4a7` numbers were
+  measured with it. DGX OS ships R580 (580.178.04), the only driver that NVIDIA
+  validates on DGX Spark. On R580, an export of a Flare pin that includes
+  `cb6187bf` (2026-10-27) fails in "Warm compiled forwards" with
+  `Xid 13 ... Illegal Instruction Encoding` ([Flare issue #137](https://github.com/NVIDIA/flare-local-inference/issues/137));
+  on 615 the same exports pass. `085ae4a7` comes before `cb6187bf`, but this
+  recipe is measured only on 615. See [Driver 615](#driver-615).
 - Ubuntu with CUDA 13.3 (`scripts/build-flare.sh` installs `cuda-toolkit-13-3`
   if missing), and one account (`SPARK_USER`) with passwordless sudo and SSH
   between the nodes. No Docker.
+
+### Driver 615
+
+Ubuntu 24.04 `noble-updates` has the driver and prebuilt kernel modules signed
+by Canonical for the DGX OS kernel (7.0.0-1019-nvidia): no DKMS, and Secure Boot
+stays on. Stop every model, then on each node:
+
+```bash
+sudo apt-get install --no-install-recommends nvidia-driver-615-open \
+  "linux-modules-nvidia-615-open-$(uname -r)" linux-modules-nvidia-615-open-nvidia-hwe-24.04
+sudo reboot
+```
+
+`--no-install-recommends` keeps apt from adding DKMS. After the reboot,
+`nvidia-smi` shows 615.71.09 and CUDA 13.4, and `dmesg` has one new line,
+`NV_ERR_NOT_SUPPORTED` from `koobInitAperture`, which is harmless. Do one node
+first: a card with one node on 615 and three on 580 served and passed
+`tests/smoke.py`. To go back, install `nvidia-driver-580-open` and the two 580
+module packages, then reboot.
 
 ## What the stack is
 
 | Layer | Choice |
 |---|---|
-| Engine | Flare `bce032c` (main, 2026-10-24) + 4 patches (`patches/`), built from source on each node |
+| Engine | Flare `085ae4a7` (main, 2026-10-25: `bce032c` + FlashInfer `43eaf93f`) + 4 patches (`patches/`), built from source on each node |
+| Driver | NVIDIA 615.71.09 (see [Driver 615](#driver-615)) |
 | Package | `ignition export` at TP=4 with `--roce-ring`, max concurrency 4, 5 DSpark drafts, prefill chunk 4,096, csf expert-scale compression |
 | Experts | MXFP4, as DeepSeek publishes them (Flare's stock deepseek41 recipe) |
 | Engram tables | FP8 E4M3 rows, as published; read from NVMe through a 6G row cache |
@@ -132,7 +167,7 @@ average over a long Max-effort request is lower than the code-phase peak.
 | 0008 | Long conversations stay warm under snapshot-slot pressure ([Flare issue #47](https://github.com/NVIDIA/flare-local-inference/issues/47)). Flare keeps eight snapshot slots per concurrent request (32 here) and evicted the least recently used. A Qwen Code session shares them with its own subagents and side queries, so after a few minutes of subagent work its next turn prefilled the whole 381K-token context again, with 22M KV tokens free. The patch evicts by GreedyDual-Size over the tokens an eviction loses (a long conversation outlasts many short ones, an idle one still ages out) and adds `--prefix-cache-snapshots N`; this recipe sets 256. Unit and scheduler tests fail on the unpatched pin and pass with the patch; `qualify/prefix_retention.py` (in the patch) runs the scenario on a live server. |
 | 0009 | Fast warm starts ([Flare issue #93](https://github.com/NVIDIA/flare-local-inference/issues/93)). Each start, every peer re-hashes its cached rank (about 280 GB) before it serves; Flare keeps this check so that a damaged copy is fetched again. The hash ran on one thread through 4 MiB page-cache reads, at 0.6 GB/s (one core hashes SHA-256 at 2.5 GB/s, the NVMe reads 9–13 GB/s). The patch hashes on Flare's package verification workers (at most 8), and reads each payload in 16 MiB direct-I/O blocks on a second thread while the previous block is hashed. Same check: the upstream corrupted-cache test passes, and a new unit test compares direct and buffered digests. Start to serving: 7–9.5 min before, **71 s** with the patch. The reads also stay out of the page cache, which is GPU memory on GB10. |
 
-Upstream `bce032c` already carries the fixes of this recipe's earlier patches:
+Upstream `085ae4a7` (and `bce032c`) already carries the fixes of this recipe's earlier patches:
 0002 (shared memory, [#2](https://github.com/NVIDIA/flare-local-inference/issues/2), `37c87e1d`),
 0003 (RoCE proxy ABI 10, [#7](https://github.com/NVIDIA/flare-local-inference/issues/7), `e350914a`),
 0005 (finished replies no longer wait behind other decodes, `a7d51ca1` in place of
@@ -181,6 +216,9 @@ boundaries from one tokenization, `67ba265e`, `03940fa5`).
    is done. Logs: see [Logs](#logs).
    If you built Flare before patch 0009, stop the card and run
    `scripts/build-flare.sh` again on every node.
+   **Moving from `bce032c`:** build (step 2) into the new `src-085ae4a7` tree,
+   export again (step 4), stage, and start. Rank 0 then has two cache entries, so
+   set `DSV41F_PACKAGE` in the env file to the new one (the export log names it).
 8. **Test** on the head: `python3 -I tests/smoke.py`.
 
 The API is on `https://<head>:8888/v1`, model `DeepSeek-V4.1-Flash-1017-Flare`.
@@ -268,7 +306,7 @@ bin/tls-front.py                TLS on :8888, video parts become frames, one req
 bin/flare-recorder              flight recorder: /metrics (rank 0) and host state (every rank) to /var/log/spark-llm/dsv41-flare
 bin/recover-card                crash recovery on rank 0: restart all ranks, at most 3 times in 24 h
 bin/dsv41_video_frames.py       the frame sampler (from the vLLM recipe)
-patches/                        0004, 0007, 0008, 0009 for Flare bce032c (see NOTICE)
+patches/                        0004, 0007, 0008, 0009 for Flare 085ae4a7 (see NOTICE)
 scripts/build-flare.sh          build patched Flare on one node
 scripts/fetch.sh                the official checkpoint to rank 0
 scripts/export.sh               four-rank ignition export / join into rank 0's model cache
