@@ -25,8 +25,8 @@ Flare is faster for one request and for four.
 | Prose, English (median of 3; runs) | **61.4** (61.3 / 61.4 / 61.6) | 57.5 (57.2 / 59.6 / 57.5) | 41.6 | 32 |
 | Prose, Spanish (median of 3; runs) | **60.6** (62.3 / 60.2 / 60.6) | 54.4 (54.4 / 54.0 / 55.5) | 43.9 | – |
 | Two prose streams, aggregate | **92.0** (46.0 + 50.2) | 87.0 (43.6 + 45.2) | 66.8 | – |
-| `code_bench`, 1 stream (median of 3; runs) | not run | **91.9** (95.2 / 91.9 / 89.5) | 73.8 | 61.2 |
-| `code_bench`, 4 streams, aggregate (median of 3; runs) | not run | **160.2** (160.2 / 159.4 / 172.0; 40.0 per stream) | 84.4 | 126.4 |
+| `code_bench`, 1 stream (median of 3; runs) | **94.3** (94.3 / 93.9 / 94.7) | 91.9 (95.2 / 91.9 / 89.5) | 73.8 | 61.2 |
+| `code_bench`, 4 streams, aggregate (median of 3; runs) | **186.0** (157.9 / 186.0 / 187.3; 46.5 per stream) | 160.2 (160.2 / 159.4 / 172.0; 40.0 per stream) | 84.4 | 126.4 |
 | Cold prefill, 20K tokens (tok/s) | 3,621 | **3,737** | 3,344 | ~3,500 |
 
 `bench.py` rows: 350-word answers at temperature 0, low effort, 3 runs, on an idle
