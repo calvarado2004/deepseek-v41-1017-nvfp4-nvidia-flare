@@ -1,5 +1,5 @@
 [Unit]
-Description=Restart the NVIDIA Flare DeepSeek-V4.1-Flash-1017 card after a crash (at most 3 times in 24 h)
+Description=Restart the NVIDIA Hyperflare DeepSeek-V4.1-Flash-1017 card after a crash (at most 3 times in 24 h)
 # Started by OnFailure= of spark-llm-dsv41-flare@0 (drop-in recover.conf, rank 0 only).
 # bin/recover-card decides: only a card that was serving and was not being stopped.
 

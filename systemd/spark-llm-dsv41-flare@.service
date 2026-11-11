@@ -1,5 +1,5 @@
 [Unit]
-Description=NVIDIA Flare DeepSeek-V4.1-Flash-1017 NVFP4, TP=4 on the four-Spark ring (node rank %i of 4) on DGX Spark
+Description=NVIDIA Hyperflare DeepSeek-V4.1-Flash-1017 NVFP4, TP=4 on the four-Spark ring (node rank %i of 4) on DGX Spark
 After=network-online.target
 Wants=network-online.target
 # Add Conflicts= for any other model unit that uses the same GPUs.

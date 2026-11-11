@@ -20,7 +20,7 @@ U=spark-llm-dsv41-flare@.service
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 { cat "$here/deepseek-v41-1017-flare.env"; echo; echo "# from cluster.env"
   echo "DSV41F_MASTER_ADDR=$SPARK_HEAD_FABRIC"
-  echo "DSV41F_FLARE=$FLARE_SRC/flare/target/release/flare"
+  echo "DSV41F_FLARE=$FLARE_BIN/flare"
   echo "DSV41F_RECOVER_PEERS=\"${SPARK_RECOVER_PEERS:-${hosts[*]:1:3}}\""; } > "$tmp/deepseek-v41-1017-flare.env"
 for f in "$U" spark-llm-dsv41-flare-recover.service; do
   sed -e "s/@SPARK_USER@/$SPARK_USER/g" -e "s/@SPARK_RING_PEERS@/$SPARK_RING_PEERS/g" \
@@ -58,7 +58,7 @@ for i in "${!hosts[@]}"; do
     sudo install -d -o $SPARK_USER -g $SPARK_USER -m 755 /var/log/spark-llm/dsv41-flare
     sudo systemctl daemon-reload
     ! grep -q '^\[Install\]' '/etc/systemd/system/$U'
-    [ -x $FLARE_SRC/flare/target/release/flare ] && echo '  flare present' || echo '  flare MISSING (scripts/build-flare.sh)'
+    [ -x $FLARE_BIN/flare ] && echo '  flare present' || echo '  flare MISSING (scripts/build-flare.sh)'
     $check_package
     ls \$HOME/.cache/flare/publishers/*.json >/dev/null 2>&1 && echo '  publisher profile present' || echo '  publisher profile MISSING (scripts/publisher.sh)'
     echo staged"

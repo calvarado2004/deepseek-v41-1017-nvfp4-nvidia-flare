@@ -1,0 +1,46 @@
+From d916cc7bdf23edfea412d094794cabcbbaaeca9e Mon Sep 17 00:00:00 2001
+From: Carlos Alvarado Martinez <45523697+calvarado2004@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 09:45:24 -0500
+Subject: [PATCH] Capture the first serving graph with a graph-pool cuBLAS
+ workspace
+
+PyTorch caches one cuBLAS workspace per handle and stream. capture_forwards
+warms every serving graph eagerly inside warmup_storage.transient, so the
+first cuBLAS call on the capture stream creates that workspace in transient
+storage. The first captured graph then records the transient address in its
+split-K GEMM and splitKreduce arguments; the following captures allocate a
+workspace from the graph pool, which export records.
+
+Export releases transient storage, so the first graph (the largest prefill
+capacity) replays a pointer that no recorded allocation owns. On DeepSeek V4.1
+TP4 GB10 at 7f534bb6 with --prefill-chunk-size 8192, prefill8192 wrote to an
+unmapped address (Xid 31 FAULT_PDE VIRT_WRITE, CUDA_ERROR_ILLEGAL_ADDRESS on
+every rank) for any prompt above 7168 tokens. With chunk 4096 a later recorded
+allocation happened to cover the address, so prefill4096 wrote its split-K
+partials into storage another allocation owns.
+
+Clear the cached workspaces after the warmups and before the first capture.
+---
+ ignition/preparation/capture.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/ignition/preparation/capture.py b/ignition/preparation/capture.py
+index ec07f343..e7df7fc1 100644
+--- a/ignition/preparation/capture.py
++++ b/ignition/preparation/capture.py
+@@ -116,6 +116,12 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
+                     function()
+             stream.synchronize()
+             stage.update(advance=1)
++    # PyTorch caches one cuBLAS workspace per handle and stream, and the eager warmups above
++    # created it inside transient storage. The first capture would otherwise bake that address
++    # into its split-K GEMMs and export it unrecorded; later captures already take theirs from
++    # the graph pool. Drop the cached workspaces so every capture allocates its own there.
++    torch.cuda.synchronize(device)
++    torch._C._cuda_clearCublasWorkspaces()
+     with phase(progress, label, total=len(names)) as stage:
+         for name in names:
+             function = compiled.get(name, functions[name])
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build patched Flare (native CLI + Ignition venv) on one Spark. Run on the Spark itself:
+# Build patched Hyperflare (native CLI + Ignition venv) on one Spark. Run on the Spark itself:
 #   scripts/build-flare.sh            # uses pins.env next to scripts/
 # Installs build packages and cuda-toolkit-13-3 if missing, rustup and uv in ~/.
 # Starts nothing.
@@ -33,11 +33,15 @@ fi
 cd "$FLARE_SRC"
 git fetch -q origin
 git checkout -q -B card "$FLARE_COMMIT"
-git -c user.name=card -c user.email=card@localhost am -q "$here"/patches/*.patch
+# Recipe patches, if any (0012 on 7f534bb6).
+shopt -s nullglob
+patches=("$here"/patches/*.patch)
+[ ${#patches[@]} -eq 0 ] || git -c user.name=card -c user.email=card@localhost am -q "${patches[@]}"
 git log --oneline -4
 
 uv sync --locked --extra prepare --extra test
-cargo build --release --manifest-path flare/Cargo.toml
+# The native CLI moved from flare/ to flare-cli/ upstream (bbad44fe); aarch64 builds include RoCE.
+cargo build --release --locked --manifest-path flare-cli/Cargo.toml
 # The extension embeds Helios; rebuild it so it carries the patched Helios.
 uv pip install --python .venv/bin/python --no-deps --reinstall ./heliopause
 
@@ -53,6 +57,6 @@ cuda = "$FLARE_CUDA"
 reserve = "6G"
 EOF
 fi
-./flare/target/release/flare --version
+./flare-cli/target/release/flare --version
 .venv/bin/python -c "import ignition, flashinfer, torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, torch.cuda.get_device_capability())"
 echo built

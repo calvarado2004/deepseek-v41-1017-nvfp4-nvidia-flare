@@ -8,7 +8,9 @@
   count      thinking off (chat_template_kwargs.enable_thinking=false): 1..30 exact
   thinking   default mode, reasoning_effort low: reasoning, then the right answer
   tools      tool_choice auto: one get_weather call with valid JSON arguments
-  forced     tool_choice required, no thinking request (patch 0004; was HTTP 400)
+  forced     tool_choice required, no thinking request (was HTTP 400; upstream 585702d3)
+  literal    "<｜image｜>" and "<｜deepseek_image｜>" as plain request text (was HTTP 400; upstream ac7bfa9a)
+  budget     thinking_token_budget 200 caps the reasoning (upstream #167; usage reasoning_tokens, #170)
   video      a red dot moves left to right: the model names the direction (the TLS
              front turns video_url into frames; skipped without OpenCV)
 
@@ -64,6 +66,23 @@ def tools(choice):
     return ok, [x["function"] for x in calls] or c["message"].get("content", "")[:120]
 
 
+def literal():
+    text = ("A tool read a tokenizer file. It holds the strings <｜image｜> and <｜deepseek_image｜>. "
+            "How many distinct strings did it hold? Answer with the number only.")
+    c = chat(text, **OFF)
+    answer = c["message"].get("content") or ""
+    return "2" in answer, answer[:120]
+
+
+def budget():
+    body = {"model": MODEL, "max_tokens": 4096, "reasoning_effort": "high", "thinking_token_budget": 200,
+            "messages": [{"role": "user", "content": "Prove that there are infinitely many primes of the "
+                                                    "form 4k+3, then give the five smallest."}]}
+    r = call("/v1/chat/completions", body)
+    used = ((r.get("usage") or {}).get("completion_tokens_details") or {}).get("reasoning_tokens")
+    return used is not None and used <= 220, f"reasoning_tokens={used}, finish={r['choices'][0]['finish_reason']}"
+
+
 def video():
     try:
         import cv2, numpy as np
@@ -85,7 +104,8 @@ def video():
 
 
 CHECKS = [("models", models), ("count", count), ("thinking", thinking),
-          ("tools", lambda: tools("auto")), ("forced", lambda: tools("required")), ("video", video)]
+          ("tools", lambda: tools("auto")), ("forced", lambda: tools("required")),
+          ("literal", literal), ("budget", budget), ("video", video)]
 
 if __name__ == "__main__":
     failed = 0

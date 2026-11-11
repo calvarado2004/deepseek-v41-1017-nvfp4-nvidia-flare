@@ -1,12 +1,13 @@
-DeepSeek-V4.1-Flash-1017 on NVIDIA Flare, four DGX Sparks
+DeepSeek-V4.1-Flash-1017 on NVIDIA Hyperflare, four DGX Sparks
 Copyright (c) 2026 Carlos Alvarado Martinez — MIT, see LICENSE.
 
 This repository includes third-party material under its own licenses:
 
-- patches/0004, 0007, 0008, 0009: changes to NVIDIA/flare-local-inference (Apache-2.0) at
-  bce032c014bae34502ba22d3304fa084d5b40afe; they are Apache-2.0 like the code
-  they change. 0008 is also proposed upstream on NVIDIA/flare-local-inference#47, 0009 on
-  NVIDIA/flare-local-inference#93.
+- patches/0012: a change to NVIDIA/hyperflare-inference (Apache-2.0) at
+  7f534bb66c26e3b380cf0a6ac1fb3c4b04d87722; it is Apache-2.0 like the code it
+  changes. It is proposed upstream on NVIDIA/hyperflare-inference#266.
+- tests/check-unmapped.py reads Hyperflare's package format through the
+  protobuf schemas of the pinned tree (helios/proto), which it compiles at run time.
 - bin/dsv41_video_frames.py: from calvarado2004/deepseek-v41-1017-nvfp4 (MIT,
   same author), unchanged.
 - assets/deepseek-logo.svg: from Wikimedia Commons, MIT, originally published
@@ -14,7 +15,7 @@ This repository includes third-party material under its own licenses:
 
 Not included, fetched or built on the nodes by the scripts:
 
-- NVIDIA flare-local-inference (Apache-2.0) and its locked dependencies:
-  scripts/build-flare.sh.
+- NVIDIA hyperflare-inference (Apache-2.0; formerly flare-local-inference) and
+  its locked dependencies: scripts/build-flare.sh.
 - The checkpoint deepseek-ai/DeepSeek-V4.1-Flash-1017, under its own model
   license: scripts/fetch.sh.

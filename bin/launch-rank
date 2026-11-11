@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# Run one rank of DeepSeek-V4.1-Flash-1017 (official deepseek-ai weights) on NVIDIA Flare at TP=4
+# Run one rank of DeepSeek-V4.1-Flash-1017 (official deepseek-ai weights) on NVIDIA Hyperflare at TP=4
 # across four Sparks cabled in a loop with no switch:
 #
 #   rank 0 -> rank 1 -> rank 2 -> rank 3 -> rank 0 (one QSFP cable each)
 #
-# Engine: Flare (Helios runtime) at pins.env FLARE_COMMIT plus ../patches, running the
+# Engine: Hyperflare (Helios runtime) at pins.env FLARE_COMMIT plus ../patches, running the
 # signed package that scripts/export.sh published in rank 0's model cache. This is
 # Flare's documented manual mode (docs/multi-host.md, "Start ranks manually"): rank 0
 # serves the cache entry in place and sends each peer its ranges over the fabric at
@@ -30,7 +30,7 @@ fi
 NODE_RANK="$1"
 
 RUNTIME_ROOT="${DSV41F_RUNTIME_ROOT:-/opt/spark-llm/profiles/deepseek-v41-1017-flare}"
-FLARE="${DSV41F_FLARE:-$RUNTIME_ROOT/src-085ae4a7/flare/target/release/flare}"
+FLARE="${DSV41F_FLARE:-$RUNTIME_ROOT/src-7f534bb6/flare-cli/target/release/flare}"
 # Rank 0 only: the model.safetensors of the export's cache entry (scripts/export.sh).
 PACKAGE="${DSV41F_PACKAGE:-}"
 PUBLISHER_KEY="${DSV41F_PUBLISHER_KEY:-}"
@@ -86,7 +86,7 @@ fi
 # shellcheck disable=SC2206
 [ -n "$EXTRA_FLAGS" ] && args+=($EXTRA_FLAGS)
 
-echo "DeepSeek-V4.1-Flash-1017 on Flare tp=4 rank=$NODE_RANK package=${PACKAGE:-from rank 0}" \
+echo "DeepSeek-V4.1-Flash-1017 on Hyperflare tp=4 rank=$NODE_RANK package=${PACKAGE:-from rank 0}" \
      "rendezvous=$MASTER_ADDR:$MASTER_PORT engram_cache=$ENGRAM_CACHE extra=[${EXTRA_FLAGS}]"
 
 "$FLARE" "${args[@]}" < /dev/null &
