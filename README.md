@@ -4,6 +4,14 @@
 
 # DeepSeek-V4.1-Flash-1017 on NVIDIA Hyperflare, four DGX Sparks
 
+> [!NOTE]
+> **Since 2026-11-12 our production card for this model is
+> [calvarado2004/deepseek-v41-1017-pico-4x-dgx-spark](https://github.com/calvarado2004/deepseek-v41-1017-pico-4x-dgx-spark)**:
+> the same official weights on [pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4), on the
+> same four Sparks and the same ring. On the same benchmarks, the same day: one user 84.9 / 143.1
+> tok/s chat / code (Hyperflare 49.6 / 99.2), 16 users 361.8 tok/s (192.7), cold prefill 9.3k-9.7k
+> tok/s (4.1k-4.3k), needles to 955K on both. This Hyperflare recipe stays as it is and still works.
+
 A recipe that serves DeepSeek's official weights,
 [`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 (MXFP4 routed experts, FP8 Engram tables, loaded as published), with
